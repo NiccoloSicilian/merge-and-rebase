@@ -393,8 +393,8 @@ def main() -> None:
         )
 
         # Optional local .pt checkpoints for activation extraction models (theseus)
-        activation_source_ckpt = cfg.get("activation_source_ckpt", None)
-        activation_target_ckpt = cfg.get("activation_target_ckpt", None)
+        activation_source_ckpt = cfg.get("activation_source_ckpt", None) or None
+        activation_target_ckpt = cfg.get("activation_target_ckpt", None) or None
 
         print(f"Source model (A): {source_cfg.model_name} / {source_cfg.pretrained}")
         print(f"Target model (B): {target_cfg.model_name} / {target_cfg.pretrained}")
