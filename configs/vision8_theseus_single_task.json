@@ -29,6 +29,6 @@
   "no_humanize": true,
   "weights": null,
   "tuned_ckpts": {
-    "DTD": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_datacomp_finetune_DTD.pt"
+    "DTD": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_vitb16_laion2b_finetune_DTD.pt"
   }
 }
