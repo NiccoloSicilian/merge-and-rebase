@@ -5,8 +5,8 @@
   "source_clip_pretrained": "laion2b_s34b_b88k",
   "target_clip_model": "ViT-B-16-plus-240",
   "target_clip_pretrained": "laion400m_e32",
-  "activation_source_ckpt": null,
-  "activation_target_ckpt": null,
+  "activation_source_ckpt": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_vitb16_laion2b_finetune_DTD.pt",
+  "activation_target_ckpt": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16plus240_vitb_plus_laion400m_finetune_DTD.pt",
   "method": "theseus",
   "method_params": {
     "num_batches": 10,

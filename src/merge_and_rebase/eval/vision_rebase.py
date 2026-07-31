@@ -181,6 +181,8 @@ def main() -> None:
         p.add_argument("--strict-load", action="store_true", default=None)
         p.add_argument("--method", type=str, choices=list_methods(), default=None)
         p.add_argument("--method-params", type=str, default=None, help="JSON object for rebase-method kwargs.")
+        p.add_argument("--activation-source-ckpt", type=str, default=None, help="Local .pt checkpoint for activation extraction source model (theseus).")
+        p.add_argument("--activation-target-ckpt", type=str, default=None, help="Local .pt checkpoint for activation extraction target model (theseus).")
 
         p.add_argument("--mask-mode", type=str, default=None, choices=["normal", "force"])
         p.add_argument("--vote", type=str, default=None, choices=["mean", "majority", "max"])
@@ -270,6 +272,8 @@ def main() -> None:
             "eval_before_rebase": args.eval_before_rebase,
             "block_extension_enabled": args.block_extension_enabled,
             "block_extension_params": block_extension_params_cli,
+            "activation_source_ckpt": args.activation_source_ckpt,
+            "activation_target_ckpt": args.activation_target_ckpt,
         }
         cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
