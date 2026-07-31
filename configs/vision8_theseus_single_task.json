@@ -5,8 +5,8 @@
   "source_clip_pretrained": "datacomp_xl_s13b_b90k",
   "target_clip_model": "ViT-B-16",
   "target_clip_pretrained": "laion2b_s34b_b88k",
-  "activation_source_ckpt": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_datacomp_finetune_DTD.pt",
-  "activation_target_ckpt": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_vitb16_laion2b_finetune_DTD.pt",
+  "activation_source_ckpt": null,
+  "activation_target_ckpt": null,
   "method": "theseus",
   "method_params": {
     "num_batches": 10,
