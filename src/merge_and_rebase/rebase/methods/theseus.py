@@ -932,6 +932,8 @@ class TheseusRebase:
         target_model: torch.nn.Module,
         source_dataloader: Iterable[Any] | None = None,
         target_dataloader: Iterable[Any] | None = None,
+        activation_source_model: torch.nn.Module | None = None,
+        activation_target_model: torch.nn.Module | None = None,
         target_base: Mapping[str, torch.Tensor] | None = None,
         delta: Mapping[str, torch.Tensor] | None = None,
         device: str = "cuda",
@@ -973,13 +975,20 @@ class TheseusRebase:
                 f"n_batches={n_batches}, seed={int(seed)})"
             )
 
+        # Resolve which models to use for activation extraction
+        act_source_model = activation_source_model if activation_source_model is not None else source_model
+        act_target_model = activation_target_model if activation_target_model is not None else target_model
+        using_separate_act_models = (act_source_model is not source_model) or (act_target_model is not target_model)
+        if verbose and using_separate_act_models:
+            print(f"{log_prefix} prepare: using separate models for activation extraction")
+
         patched_source = 0
         patched_target = 0
         if patch_qkv:
             if verbose:
                 print(f"{log_prefix} prepare: patching fused qkv blocks if needed")
-            patched_source = _split_fused_qkv_if_needed(source_model)
-            patched_target = _split_fused_qkv_if_needed(target_model)
+            patched_source = _split_fused_qkv_if_needed(act_source_model)
+            patched_target = _split_fused_qkv_if_needed(act_target_model)
             if patched_source > 0 or patched_target > 0:
                 logger.info(
                     "%s prepare: split fused qkv attention blocks (source=%d, target=%d)",
@@ -992,7 +1001,19 @@ class TheseusRebase:
 
         activation_registry: dict[str, ActivationStore] = {}
         transforms_by_key: dict[str, _LayerTransform] = {}
-        split_fused_qkv = bool(patch_qkv and (patched_source > 0 or patched_target > 0))
+        # Determine whether rebase state dicts need QKV splitting.
+        # When using separate activation models, the rebase models were not
+        # patched, so check them independently for fused MHA blocks.
+        if using_separate_act_models:
+            rebase_has_fused = patch_qkv and (
+                _has_fused_mha(_visual_module(source_model))
+                or _has_fused_mha(_visual_module(target_model))
+            )
+        else:
+            rebase_has_fused = False
+        split_fused_qkv = bool(
+            patch_qkv and (patched_source > 0 or patched_target > 0 or rebase_has_fused)
+        )
         unpatched_source = 0
         unpatched_target = 0
         try:
@@ -1005,8 +1026,8 @@ class TheseusRebase:
                     print(f"{log_prefix} prepare: collecting activations")
 
                 activation_registry = collect_activations(
-                    source_model,
-                    target_model,
+                    act_source_model,
+                    act_target_model,
                     source_dataloader,
                     target_dataloader,
                     device=device,
@@ -1069,8 +1090,8 @@ class TheseusRebase:
         finally:
             if patch_qkv and (patched_source > 0 or patched_target > 0):
                 try:
-                    unpatched_source = int(merge_openclip_vit_attn(_visual_module(source_model)))
-                    unpatched_target = int(merge_openclip_vit_attn(_visual_module(target_model)))
+                    unpatched_source = int(merge_openclip_vit_attn(_visual_module(act_source_model)))
+                    unpatched_target = int(merge_openclip_vit_attn(_visual_module(act_target_model)))
                     if verbose:
                         print(
                             f"{log_prefix} prepare: recomposed fused qkv blocks "
@@ -1187,6 +1208,8 @@ class TheseusRebase:
         target_model: torch.nn.Module | None = None,
         source_dataloader: Iterable[Any] | None = None,
         target_dataloader: Iterable[Any] | None = None,
+        activation_source_model: torch.nn.Module | None = None,
+        activation_target_model: torch.nn.Module | None = None,
         device: str = "cuda",
         seq_align: str = "interpolate2d",
         center_acts: bool = False,
@@ -1223,6 +1246,8 @@ class TheseusRebase:
                 target_model=target_model,
                 source_dataloader=source_dataloader,
                 target_dataloader=target_dataloader,
+                activation_source_model=activation_source_model,
+                activation_target_model=activation_target_model,
                 target_base=target_base,
                 delta=delta,
                 device=device,

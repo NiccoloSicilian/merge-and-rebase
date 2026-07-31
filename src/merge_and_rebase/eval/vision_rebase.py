@@ -388,11 +388,35 @@ def main() -> None:
             dtype=cfg.get("dtype", None),
         )
 
+        # Optional separate models for activation extraction (theseus)
+        act_source_cfg = None
+        act_target_cfg = None
+        if cfg.get("activation_source_clip_model") is not None:
+            act_source_cfg = OpenClipBuildConfig(
+                model_name=cfg["activation_source_clip_model"],
+                pretrained=cfg.get("activation_source_clip_pretrained", "openai"),
+                device=device,
+                dtype=cfg.get("dtype", None),
+            )
+        if cfg.get("activation_target_clip_model") is not None:
+            act_target_cfg = OpenClipBuildConfig(
+                model_name=cfg["activation_target_clip_model"],
+                pretrained=cfg.get("activation_target_clip_pretrained", "openai"),
+                device=device,
+                dtype=cfg.get("dtype", None),
+            )
+
         print(f"Source model (A): {source_cfg.model_name} / {source_cfg.pretrained}")
         print(f"Target model (B): {target_cfg.model_name} / {target_cfg.pretrained}")
+        if act_source_cfg is not None:
+            print(f"Activation source model: {act_source_cfg.model_name} / {act_source_cfg.pretrained}")
+        if act_target_cfg is not None:
+            print(f"Activation target model: {act_target_cfg.model_name} / {act_target_cfg.pretrained}")
 
         clf_source = OpenClipClassifier.build(source_cfg)
         clf_target = OpenClipClassifier.build(target_cfg)
+        clf_act_source = OpenClipClassifier.build(act_source_cfg) if act_source_cfg is not None else None
+        clf_act_target = OpenClipClassifier.build(act_target_cfg) if act_target_cfg is not None else None
 
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
@@ -793,11 +817,16 @@ def main() -> None:
                 load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
                 load_into_model(target_model_for_theseus, target_base_sd, strict=False)
 
+                act_source = clf_act_source.model if clf_act_source is not None else None
+                act_target = clf_act_target.model if clf_act_target is not None else None
+
                 prepared = method.prepare(
                     source_model=source_model_for_theseus,
                     target_model=target_model_for_theseus,
                     source_dataloader=source_loaders.train,
                     target_dataloader=loaders.train,
+                    activation_source_model=act_source,
+                    activation_target_model=act_target,
                     target_base=target_base_sd,
                     delta=task_delta,
                     device=device,
