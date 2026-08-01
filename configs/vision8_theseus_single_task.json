@@ -10,11 +10,11 @@
   "method": "theseus",
   "method_params": {
     "num_batches": 1,
-    "batch_size": 32,
+    "batch_size": 10,
     "seq_align": "interpolate2d",
     "split_qkv": true,
     "center_acts": false,
-    "n_interpolations": 500,
+    "n_interpolations": 1500,
     "use_fmap": true,
     "activations_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/activations_cache/theseus_MNIST_vitb16_vitb16plus_1b32s500i.pt"
   },
