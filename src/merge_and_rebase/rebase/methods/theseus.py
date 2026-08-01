@@ -495,7 +495,11 @@ def collect_activations(
     return registry
 
 
-def _save_activation_registry(registry: dict[str, ActivationStore], path: str) -> None:
+def _save_activation_registry(
+    registry: dict[str, ActivationStore],
+    path: str,
+    n_real_samples_per_layer: dict[str, int] | None = None,
+) -> None:
     """Save raw activations from the registry to disk."""
     import os
     data: dict[str, dict] = {}
@@ -511,16 +515,21 @@ def _save_activation_registry(registry: dict[str, ActivationStore], path: str) -
                 "sum_b": store.sum_b,
                 "at_a": store.at_a,
                 "bt_b": store.bt_b,
+                "n_real_samples": n_real_samples_per_layer.get(key, store.n_samples) if n_real_samples_per_layer else store.n_samples,
             }
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(data, path)
     print(f"[theseus] Saved activation registry ({len(data)} layers) to {path}")
 
 
-def _load_activation_registry(path: str) -> dict[str, ActivationStore]:
-    """Load raw activations from disk into an activation registry."""
+def _load_activation_registry(path: str) -> tuple[dict[str, ActivationStore], dict[str, int]]:
+    """Load raw activations from disk into an activation registry.
+
+    Returns (registry, n_real_samples_per_layer).
+    """
     data = torch.load(path, map_location="cpu", weights_only=False)
     registry: dict[str, ActivationStore] = {}
+    n_real: dict[str, int] = {}
     for key, entry in data.items():
         store = ActivationStore(store_raw=True)
         store.h_a_list = [entry["src"]]
@@ -531,9 +540,10 @@ def _load_activation_registry(path: str) -> dict[str, ActivationStore]:
         store.sum_b = entry["sum_b"]
         store.at_a = entry.get("at_a")
         store.bt_b = entry.get("bt_b")
+        n_real[key] = entry.get("n_real_samples", store.n_samples)
         registry[key] = store
     print(f"[theseus] Loaded activation registry ({len(registry)} layers) from {path}")
-    return registry
+    return registry, n_real
 
 
 def _augment_registry_with_interpolations(
@@ -583,9 +593,9 @@ def _augment_registry_with_interpolations(
 def _compute_fmap_from_activations(
     activation_registry: dict[str, ActivationStore],
     *,
-    n_anchors: int | None = None,
+    n_anchors_per_layer: dict[str, int] | None = None,
     num_eigs: int = 50,
-    k_graph: int = 12,
+    k_graph: int | None = None,
     device: str | torch.device = "cpu",
     verbose: bool = True,
 ) -> dict[str, torch.Tensor]:
@@ -609,19 +619,33 @@ def _compute_fmap_from_activations(
             continue
 
         n_samples = src_rows.shape[0]
+        d_src = src_rows.shape[1]
+        d_tgt = tgt_rows.shape[1]
         if n_samples < 3:
             if verbose:
                 print(f"{log_prefix} {key}: skipped (only {n_samples} samples)")
             continue
+        # Skip layers with too many points (e.g. raw pixel inputs) or tiny feature dim
+        if n_samples > 100_000:
+            if verbose:
+                print(f"{log_prefix} {key}: skipped (too many points: {n_samples})")
+            continue
+        if d_src < 10 or d_tgt < 10:
+            if verbose:
+                print(f"{log_prefix} {key}: skipped (feature dim too small: {d_src}, {d_tgt})")
+            continue
 
         # Anchors: first n_anchors samples share index correspondence
-        n_anch = n_anchors if n_anchors is not None else n_samples
+        n_anch = n_samples
+        if n_anchors_per_layer is not None and key in n_anchors_per_layer:
+            n_anch = n_anchors_per_layer[key]
         n_anch = min(n_anch, n_samples)
         anchors = torch.stack(
             [torch.arange(n_anch), torch.arange(n_anch)], dim=1
         )
 
         n_eig = min(num_eigs, n_samples - 1)
+        k_eff = k_graph if k_graph is not None else max(int(n_samples * 0.07), 5)
         x_np = src_rows.numpy().astype(np.float64)
         y_np = tgt_rows.numpy().astype(np.float64)
 
@@ -629,7 +653,7 @@ def _compute_fmap_from_activations(
             print(
                 f"{log_prefix} {key}: computing FM_T  "
                 f"src={x_np.shape}  tgt={y_np.shape}  "
-                f"anchors={n_anch}  eigs={n_eig}  k={k_graph}"
+                f"anchors={n_anch}  eigs={n_eig}  k={k_eff}"
             )
 
         try:
@@ -643,7 +667,7 @@ def _compute_fmap_from_activations(
                 graph_similarity="angular",
                 graph_kernel="distance",
                 descriptors=("dist_geod",),
-                k=k_graph,
+                k=k_eff,
                 n_descr=1,
                 compute_gt_map=False,
                 refine=True,
@@ -1151,7 +1175,7 @@ class TheseusRebase:
         n_interpolations: int = 0,
         use_fmap: bool = False,
         fmap_num_eigs: int = 50,
-        fmap_k_graph: int = 12,
+        fmap_k_graph: int | None = None,
         activations_path: str | None = None,
         verbose: bool = True,
         show_progress: bool = True,
@@ -1232,11 +1256,9 @@ class TheseusRebase:
 
                 if _act_path and os.path.isfile(_act_path):
                     # Load cached activations
-                    activation_registry = _load_activation_registry(_act_path)
-                    sample_store = next(iter(activation_registry.values()), None)
-                    n_real_samples = sample_store.n_samples if sample_store else 0
+                    activation_registry, n_real_samples_per_layer = _load_activation_registry(_act_path)
                     if verbose:
-                        print(f"{log_prefix} prepare: loaded cached activations ({len(activation_registry)} layers, {n_real_samples} samples)")
+                        print(f"{log_prefix} prepare: loaded cached activations ({len(activation_registry)} layers)")
                 else:
                     if source_dataloader is None or target_dataloader is None:
                         raise ValueError(
@@ -1262,9 +1284,10 @@ class TheseusRebase:
                     if verbose:
                         print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
 
-                    # Save original sample count (real correspondences) before interpolation
-                    sample_store = next(iter(activation_registry.values()), None)
-                    n_real_samples = sample_store.n_samples if sample_store else 0
+                    # Save per-layer sample counts (real correspondences) before interpolation
+                    n_real_samples_per_layer = {
+                        key: store.n_samples for key, store in activation_registry.items()
+                    }
 
                     if n_interpolations > 0:
                         activation_registry = _augment_registry_with_interpolations(
@@ -1279,16 +1302,16 @@ class TheseusRebase:
 
                     # Save to disk for reuse
                     if _act_path:
-                        _save_activation_registry(activation_registry, _act_path)
+                        _save_activation_registry(activation_registry, _act_path, n_real_samples_per_layer)
 
                 if use_fmap:
                     if verbose:
-                        print(f"{log_prefix} prepare: computing functional maps (anchors={n_real_samples})")
+                        print(f"{log_prefix} prepare: computing functional maps")
                     fmap_transforms = _compute_fmap_from_activations(
                         activation_registry,
-                        n_anchors=n_real_samples,
+                        n_anchors_per_layer=n_real_samples_per_layer,
                         num_eigs=int(fmap_num_eigs),
-                        k_graph=int(fmap_k_graph),
+                        k_graph=fmap_k_graph,
                         device=device,
                         verbose=bool(verbose),
                     )
@@ -1480,7 +1503,7 @@ class TheseusRebase:
         n_interpolations: int = 0,
         use_fmap: bool = False,
         fmap_num_eigs: int = 50,
-        fmap_k_graph: int = 12,
+        fmap_k_graph: int | None = None,
         activations_path: str | None = None,
         verbose: bool = True,
         show_progress: bool = True,
