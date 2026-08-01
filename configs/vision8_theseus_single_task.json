@@ -16,7 +16,7 @@
     "center_acts": false,
     "n_interpolations": 1500,
     "use_fmap": true,
-    "activations_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/activations_cache/theseus_MNIST_vitb16_vitb16plus_1b32s500i.pt"
+    "activations_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/activations_cache/theseus_MNIST_vitb16_vitb16plus_1b10s1500i.pt"
   },
   "alpha_search": true,
   "alpha_selection": "shared",
