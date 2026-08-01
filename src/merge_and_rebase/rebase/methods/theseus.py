@@ -299,8 +299,8 @@ class ActivationStore:
         self.h_b_list: list[torch.Tensor] = []
 
     def update(self, batch_a: torch.Tensor, batch_b: torch.Tensor) -> None:
-        a = batch_a.detach().cpu().to(torch.float64)
-        b = batch_b.detach().cpu().to(torch.float64)
+        a = batch_a.detach().cpu().to(torch.float64).clone()
+        b = batch_b.detach().cpu().to(torch.float64).clone()
 
         if self.store_raw:
             self.h_a_list.append(a.float())
