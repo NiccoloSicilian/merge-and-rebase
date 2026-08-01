@@ -14,7 +14,7 @@
     "seq_align": "interpolate2d",
     "split_qkv": true,
     "center_acts": false,
-    "n_interpolations": 22600,
+    "n_interpolations": 500,
     "use_fmap": true
   },
   "alpha_search": true,

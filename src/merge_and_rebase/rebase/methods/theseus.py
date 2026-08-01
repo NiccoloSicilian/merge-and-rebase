@@ -625,6 +625,10 @@ def _compute_fmap_from_activations(
         except Exception as exc:
             print(f"{log_prefix} {key}: fmap computation failed — {exc}")
 
+        # Free raw activations for this layer to avoid OOM
+        store.h_a_list.clear()
+        store.h_b_list.clear()
+
     return fmap_transforms
 
 
