@@ -412,7 +412,7 @@ class _ActivationHook:
             handle.remove()
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def collect_activations(
     source_model: torch.nn.Module,
     target_model: torch.nn.Module,
