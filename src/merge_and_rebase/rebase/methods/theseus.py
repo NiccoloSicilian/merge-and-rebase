@@ -1209,6 +1209,10 @@ class TheseusRebase:
                 if verbose:
                     print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
 
+                # Save original sample count (real correspondences) before interpolation
+                sample_store = next(iter(activation_registry.values()), None)
+                n_real_samples = sample_store.n_samples if sample_store else 0
+
                 if n_interpolations > 0:
                     activation_registry = _augment_registry_with_interpolations(
                         activation_registry,
@@ -1222,9 +1226,10 @@ class TheseusRebase:
 
                 if use_fmap:
                     if verbose:
-                        print(f"{log_prefix} prepare: computing functional maps")
+                        print(f"{log_prefix} prepare: computing functional maps (anchors={n_real_samples})")
                     fmap_transforms = _compute_fmap_from_activations(
                         activation_registry,
+                        n_anchors=n_real_samples,
                         num_eigs=int(fmap_num_eigs),
                         k_graph=int(fmap_k_graph),
                         device=device,
