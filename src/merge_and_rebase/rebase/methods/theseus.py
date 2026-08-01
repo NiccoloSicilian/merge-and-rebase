@@ -495,6 +495,47 @@ def collect_activations(
     return registry
 
 
+def _save_activation_registry(registry: dict[str, ActivationStore], path: str) -> None:
+    """Save raw activations from the registry to disk."""
+    import os
+    data: dict[str, dict] = {}
+    for key, store in registry.items():
+        src, tgt = store.rows(center=False)
+        if src is not None and tgt is not None:
+            data[key] = {
+                "src": src,
+                "tgt": tgt,
+                "n_samples": store.n_samples,
+                "at_b": store.at_b,
+                "sum_a": store.sum_a,
+                "sum_b": store.sum_b,
+                "at_a": store.at_a,
+                "bt_b": store.bt_b,
+            }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(data, path)
+    print(f"[theseus] Saved activation registry ({len(data)} layers) to {path}")
+
+
+def _load_activation_registry(path: str) -> dict[str, ActivationStore]:
+    """Load raw activations from disk into an activation registry."""
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    registry: dict[str, ActivationStore] = {}
+    for key, entry in data.items():
+        store = ActivationStore(store_raw=True)
+        store.h_a_list = [entry["src"]]
+        store.h_b_list = [entry["tgt"]]
+        store.n_samples = entry["n_samples"]
+        store.at_b = entry["at_b"]
+        store.sum_a = entry["sum_a"]
+        store.sum_b = entry["sum_b"]
+        store.at_a = entry.get("at_a")
+        store.bt_b = entry.get("bt_b")
+        registry[key] = store
+    print(f"[theseus] Loaded activation registry ({len(registry)} layers) from {path}")
+    return registry
+
+
 def _augment_registry_with_interpolations(
     registry: dict[str, ActivationStore],
     *,
@@ -1111,6 +1152,7 @@ class TheseusRebase:
         use_fmap: bool = False,
         fmap_num_eigs: int = 50,
         fmap_k_graph: int = 12,
+        activations_path: str | None = None,
         verbose: bool = True,
         show_progress: bool = True,
         **kwargs,
@@ -1185,44 +1227,59 @@ class TheseusRebase:
         unpatched_target = 0
         try:
             if covariance_mode == "activations":
-                if source_dataloader is None or target_dataloader is None:
-                    raise ValueError(
-                        "Theseus activation covariance mode requires both source_dataloader and target_dataloader."
-                    )
-                if verbose:
-                    print(f"{log_prefix} prepare: collecting activations")
+                import os
+                _act_path = activations_path if activations_path else None
 
-                activation_registry = collect_activations(
-                    act_source_model,
-                    act_target_model,
-                    source_dataloader,
-                    target_dataloader,
-                    device=device,
-                    seq_align=seq_align,
-                    n_batches=n_batches,
-                    seed=int(seed),
-                    batch_size=batch_size,
-                    store_raw=n_interpolations > 0 or use_fmap,
-                    store_a_gram=whiten_power > 0.0,
-                    store_b_gram=whiten_power > 0.0,
-                )
-                if verbose:
-                    print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
+                if _act_path and os.path.isfile(_act_path):
+                    # Load cached activations
+                    activation_registry = _load_activation_registry(_act_path)
+                    sample_store = next(iter(activation_registry.values()), None)
+                    n_real_samples = sample_store.n_samples if sample_store else 0
+                    if verbose:
+                        print(f"{log_prefix} prepare: loaded cached activations ({len(activation_registry)} layers, {n_real_samples} samples)")
+                else:
+                    if source_dataloader is None or target_dataloader is None:
+                        raise ValueError(
+                            "Theseus activation covariance mode requires both source_dataloader and target_dataloader."
+                        )
+                    if verbose:
+                        print(f"{log_prefix} prepare: collecting activations")
 
-                # Save original sample count (real correspondences) before interpolation
-                sample_store = next(iter(activation_registry.values()), None)
-                n_real_samples = sample_store.n_samples if sample_store else 0
-
-                if n_interpolations > 0:
-                    activation_registry = _augment_registry_with_interpolations(
-                        activation_registry,
-                        n_interpolations=n_interpolations,
+                    activation_registry = collect_activations(
+                        act_source_model,
+                        act_target_model,
+                        source_dataloader,
+                        target_dataloader,
+                        device=device,
+                        seq_align=seq_align,
+                        n_batches=n_batches,
                         seed=int(seed),
+                        batch_size=batch_size,
+                        store_raw=n_interpolations > 0 or use_fmap,
+                        store_a_gram=whiten_power > 0.0,
+                        store_b_gram=whiten_power > 0.0,
                     )
                     if verbose:
-                        sample_store = next(iter(activation_registry.values()), None)
-                        n_total = sample_store.n_samples if sample_store else 0
-                        print(f"{log_prefix} prepare: augmented with {n_interpolations} interpolations (total samples per layer: {n_total})")
+                        print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
+
+                    # Save original sample count (real correspondences) before interpolation
+                    sample_store = next(iter(activation_registry.values()), None)
+                    n_real_samples = sample_store.n_samples if sample_store else 0
+
+                    if n_interpolations > 0:
+                        activation_registry = _augment_registry_with_interpolations(
+                            activation_registry,
+                            n_interpolations=n_interpolations,
+                            seed=int(seed),
+                        )
+                        if verbose:
+                            sample_store = next(iter(activation_registry.values()), None)
+                            n_total = sample_store.n_samples if sample_store else 0
+                            print(f"{log_prefix} prepare: augmented with {n_interpolations} interpolations (total samples per layer: {n_total})")
+
+                    # Save to disk for reuse
+                    if _act_path:
+                        _save_activation_registry(activation_registry, _act_path)
 
                 if use_fmap:
                     if verbose:
@@ -1424,6 +1481,7 @@ class TheseusRebase:
         use_fmap: bool = False,
         fmap_num_eigs: int = 50,
         fmap_k_graph: int = 12,
+        activations_path: str | None = None,
         verbose: bool = True,
         show_progress: bool = True,
         **kwargs,
@@ -1466,6 +1524,7 @@ class TheseusRebase:
                 use_fmap=bool(use_fmap),
                 fmap_num_eigs=int(fmap_num_eigs),
                 fmap_k_graph=int(fmap_k_graph),
+                activations_path=activations_path,
                 verbose=bool(verbose),
                 show_progress=bool(show_progress),
                 **kwargs,

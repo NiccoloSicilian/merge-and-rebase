@@ -15,7 +15,8 @@
     "split_qkv": true,
     "center_acts": false,
     "n_interpolations": 500,
-    "use_fmap": true
+    "use_fmap": true,
+    "activations_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/activations_cache/theseus_MNIST_vitb16_vitb16plus_1b32s500i.pt"
   },
   "alpha_search": true,
   "alpha_selection": "shared",
