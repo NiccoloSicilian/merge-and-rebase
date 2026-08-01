@@ -5,6 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -494,6 +495,139 @@ def collect_activations(
     return registry
 
 
+def _augment_registry_with_interpolations(
+    registry: dict[str, ActivationStore],
+    *,
+    n_interpolations: int,
+    seed: int = 0,
+) -> dict[str, ActivationStore]:
+    """Augment activation stores with interpolated points.
+
+    For each layer, sample random pairs (j, k) from the collected activations
+    and create interpolated points:
+        src_interp = (1 - t) * src[j] + t * src[k]
+        tgt_interp = (1 - t) * tgt[j] + t * tgt[k]
+    where t is sampled uniformly from (0, 1).  The interpolated pairs are fed
+    back into the same ActivationStore so they contribute to the cross-covariance.
+    """
+    rng = torch.Generator().manual_seed(seed)
+
+    for key, store in registry.items():
+        src_rows, tgt_rows = store.rows(center=False)
+        if src_rows is None or tgt_rows is None:
+            continue
+        n = src_rows.shape[0]
+        if n < 2:
+            continue
+
+        # Sample random pairs and interpolation coefficients
+        idx_j = torch.randint(0, n, (n_interpolations,), generator=rng)
+        idx_k = torch.randint(0, n, (n_interpolations,), generator=rng)
+        # Resample collisions so j != k
+        collisions = idx_j == idx_k
+        while collisions.any():
+            idx_k[collisions] = torch.randint(0, n, (int(collisions.sum()),), generator=rng)
+            collisions = idx_j == idx_k
+
+        t = torch.rand(n_interpolations, 1, generator=rng)
+
+        src_interp = (1.0 - t) * src_rows[idx_j] + t * src_rows[idx_k]
+        tgt_interp = (1.0 - t) * tgt_rows[idx_j] + t * tgt_rows[idx_k]
+
+        store.update(src_interp, tgt_interp)
+
+    return registry
+
+
+def _compute_fmap_from_activations(
+    activation_registry: dict[str, ActivationStore],
+    *,
+    n_anchors: int | None = None,
+    num_eigs: int = 50,
+    k_graph: int = 12,
+    device: str | torch.device = "cpu",
+    verbose: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Compute functional maps and return orthogonal T matrices per registry key.
+
+    fmap.T has shape (d_src, d_tgt) — same convention as the Procrustes
+    alignment maps used by ``_precompute_transforms``, so the returned
+    tensors can directly replace them as ``t_in`` / ``t_out``.
+    """
+    from .fmap_utils import FM_T
+
+    dev = torch.device(device) if isinstance(device, str) else device
+    log_prefix = "[theseus-fmap]"
+    fmap_transforms: dict[str, torch.Tensor] = {}
+
+    for key, store in activation_registry.items():
+        src_rows, tgt_rows = store.rows(center=False)
+        if src_rows is None or tgt_rows is None:
+            if verbose:
+                print(f"{log_prefix} {key}: skipped (no raw activations)")
+            continue
+
+        n_samples = src_rows.shape[0]
+        if n_samples < 3:
+            if verbose:
+                print(f"{log_prefix} {key}: skipped (only {n_samples} samples)")
+            continue
+
+        # Anchors: first n_anchors samples share index correspondence
+        n_anch = n_anchors if n_anchors is not None else n_samples
+        n_anch = min(n_anch, n_samples)
+        anchors = torch.stack(
+            [torch.arange(n_anch), torch.arange(n_anch)], dim=1
+        )
+
+        n_eig = min(num_eigs, n_samples - 1)
+        x_np = src_rows.numpy().astype(np.float64)
+        y_np = tgt_rows.numpy().astype(np.float64)
+
+        if verbose:
+            print(
+                f"{log_prefix} {key}: computing FM_T  "
+                f"src={x_np.shape}  tgt={y_np.shape}  "
+                f"anchors={n_anch}  eigs={n_eig}  k={k_graph}"
+            )
+
+        try:
+            fmap = FM_T(
+                torch.tensor(x_np, dtype=torch.float64),
+                torch.tensor(y_np, dtype=torch.float64),
+                anchors,
+                transformation="orthogonal",
+                num_eigs=n_eig,
+                graph_algo="knn",
+                graph_similarity="angular",
+                graph_kernel="distance",
+                descriptors=("dist_geod",),
+                k=k_graph,
+                n_descr=1,
+                compute_gt_map=False,
+                refine=True,
+                device=dev,
+            )
+            # fmap.T: (d_src, d_tgt) — same convention as Procrustes maps
+            T = fmap.T
+            if isinstance(T, torch.Tensor):
+                fmap_transforms[key] = T.float().cpu()
+            else:
+                fmap_transforms[key] = torch.tensor(np.array(T), dtype=torch.float32)
+
+            sim = fmap.get_similarity()
+            c_shape = np.array(fmap.C).shape
+            print(
+                f"{log_prefix} {key}: fmap computed  "
+                f"C={c_shape}  T={tuple(fmap_transforms[key].shape)}  "
+                f"similarity={sim:.4f}"
+            )
+        except Exception as exc:
+            print(f"{log_prefix} {key}: fmap computation failed — {exc}")
+
+    return fmap_transforms
+
+
 def _compute_procrustes_map_from_cov(cov: torch.Tensor) -> torch.Tensor:
     u, _, v_h = torch.linalg.svd(cov.double(), full_matrices=False)
     return (u @ v_h).float()
@@ -694,11 +828,13 @@ def _precompute_transforms(
     whiten_eps: float,
     show_progress: bool,
     method_name: str,
+    fmap_transforms: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, _LayerTransform]:
     transforms_by_key: dict[str, _LayerTransform] = {}
     t_out_cache: dict[str, torch.Tensor] = {}
     visual_model = _visual_module(target_model)
     param_to_module = _param_to_module(visual_model)
+    use_fmap = bool(fmap_transforms)
 
     items = _iter_with_progress(
         visual_delta.items(),
@@ -724,24 +860,38 @@ def _precompute_transforms(
             out_key = f"{module_name}.out"
 
         if delta_source.ndim == 2:
-            in_store = activation_registry.get(in_key)
-            out_store = activation_registry.get(out_key)
-            if in_store is not None and out_store is not None:
-                t_in = _compute_alignment_map(
-                    in_store,
-                    center=center_acts,
-                    whiten_power=whiten_power,
-                    whiten_eps=whiten_eps,
-                )
-                t_out = _compute_alignment_map(
-                    out_store,
-                    center=center_acts,
-                    whiten_power=whiten_power,
-                    whiten_eps=whiten_eps,
-                )
-                if t_in is not None and t_out is not None:
-                    transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
-                    continue
+            # Try fmap transforms first, fall back to Procrustes
+            t_in: torch.Tensor | None = None
+            t_out: torch.Tensor | None = None
+
+            if use_fmap and in_key in fmap_transforms:
+                t_in = fmap_transforms[in_key]
+            if use_fmap and out_key in fmap_transforms:
+                t_out = fmap_transforms[out_key]
+
+            # Fall back to Procrustes for any missing fmap transform
+            if t_in is None or t_out is None:
+                in_store = activation_registry.get(in_key)
+                out_store = activation_registry.get(out_key)
+                if in_store is not None and out_store is not None:
+                    if t_in is None:
+                        t_in = _compute_alignment_map(
+                            in_store,
+                            center=center_acts,
+                            whiten_power=whiten_power,
+                            whiten_eps=whiten_eps,
+                        )
+                    if t_out is None:
+                        t_out = _compute_alignment_map(
+                            out_store,
+                            center=center_acts,
+                            whiten_power=whiten_power,
+                            whiten_eps=whiten_eps,
+                        )
+
+            if t_in is not None and t_out is not None:
+                transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
+                continue
             transforms_by_key[key] = _LayerTransform(kind="weight")
             continue
 
@@ -758,6 +908,12 @@ def _precompute_transforms(
             cached_t_out = t_out_cache.get(out_key)
             if cached_t_out is not None:
                 transforms_by_key[key] = _LayerTransform(kind="bias", t_out=cached_t_out)
+                continue
+
+            # Try fmap transform for bias
+            if use_fmap and out_key in fmap_transforms:
+                t_out_cache[out_key] = fmap_transforms[out_key]
+                transforms_by_key[key] = _LayerTransform(kind="bias", t_out=fmap_transforms[out_key])
                 continue
 
             out_store = activation_registry.get(out_key)
@@ -947,6 +1103,10 @@ class TheseusRebase:
         seed: int = 0,
         batch_size: int | None = None,
         patch_qkv: bool = True,
+        n_interpolations: int = 0,
+        use_fmap: bool = False,
+        fmap_num_eigs: int = 50,
+        fmap_k_graph: int = 12,
         verbose: bool = True,
         show_progress: bool = True,
         **kwargs,
@@ -955,6 +1115,8 @@ class TheseusRebase:
         if split_qkv is not None:
             patch_qkv = bool(split_qkv)
         del kwargs
+        n_interpolations = int(n_interpolations)
+        use_fmap = bool(use_fmap)
         # Config fallbacks num_batches -> n_batches
         if n_batches is None:
             n_batches = num_batches
@@ -1001,6 +1163,7 @@ class TheseusRebase:
 
         activation_registry: dict[str, ActivationStore] = {}
         transforms_by_key: dict[str, _LayerTransform] = {}
+        fmap_transforms: dict[str, torch.Tensor] = {}
         # Determine whether rebase state dicts need QKV splitting.
         # When using separate activation models, the rebase models were not
         # patched, so check them independently for fused MHA blocks.
@@ -1035,11 +1198,36 @@ class TheseusRebase:
                     n_batches=n_batches,
                     seed=int(seed),
                     batch_size=batch_size,
+                    store_raw=n_interpolations > 0 or use_fmap,
                     store_a_gram=whiten_power > 0.0,
                     store_b_gram=whiten_power > 0.0,
                 )
                 if verbose:
                     print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
+
+                if n_interpolations > 0:
+                    activation_registry = _augment_registry_with_interpolations(
+                        activation_registry,
+                        n_interpolations=n_interpolations,
+                        seed=int(seed),
+                    )
+                    if verbose:
+                        sample_store = next(iter(activation_registry.values()), None)
+                        n_total = sample_store.n_samples if sample_store else 0
+                        print(f"{log_prefix} prepare: augmented with {n_interpolations} interpolations (total samples per layer: {n_total})")
+
+                if use_fmap:
+                    if verbose:
+                        print(f"{log_prefix} prepare: computing functional maps")
+                    fmap_transforms = _compute_fmap_from_activations(
+                        activation_registry,
+                        num_eigs=int(fmap_num_eigs),
+                        k_graph=int(fmap_k_graph),
+                        device=device,
+                        verbose=bool(verbose),
+                    )
+                    if verbose:
+                        print(f"{log_prefix} prepare: fmap transforms computed for {len(fmap_transforms)} layers")
 
             elif verbose:
                 print(f"{log_prefix} prepare: skipping activation collection (data-free covariance mode)")
@@ -1072,6 +1260,7 @@ class TheseusRebase:
                         whiten_eps=whiten_eps,
                         show_progress=bool(show_progress),
                         method_name=self.name,
+                        fmap_transforms=fmap_transforms if fmap_transforms else None,
                     )
                 else:
                     transforms_by_key = _precompute_transforms_data_free(
@@ -1222,6 +1411,10 @@ class TheseusRebase:
         seed: int = 0,
         batch_size: int | None = None,
         patch_qkv: bool = True,
+        n_interpolations: int = 0,
+        use_fmap: bool = False,
+        fmap_num_eigs: int = 50,
+        fmap_k_graph: int = 12,
         verbose: bool = True,
         show_progress: bool = True,
         **kwargs,
@@ -1260,6 +1453,10 @@ class TheseusRebase:
                 seed=int(seed),
                 batch_size=batch_size,
                 patch_qkv=patch_qkv,
+                n_interpolations=int(n_interpolations),
+                use_fmap=bool(use_fmap),
+                fmap_num_eigs=int(fmap_num_eigs),
+                fmap_k_graph=int(fmap_k_graph),
                 verbose=bool(verbose),
                 show_progress=bool(show_progress),
                 **kwargs,
