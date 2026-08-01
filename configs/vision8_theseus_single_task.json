@@ -1,15 +1,15 @@
 {
   "suite": "vision8",
-  "tasks": "MNIST",
+  "tasks": "EuroSAT",
   "source_clip_model": "ViT-B-16",
   "source_clip_pretrained": "laion2b_s34b_b88k",
   "target_clip_model": "ViT-B-16-plus-240",
   "target_clip_pretrained": "laion400m_e32",
-  "activation_source_ckpt": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_laion_finetune_MNIST.pt",
-  "activation_target_ckpt": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16plus240_vitb_plus_laion400m_finetune_MNIST.pt",
+  "activation_source_ckpt": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_laion_finetune_EuroSAT.pt",
+  "activation_target_ckpt": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16plus240_vitb_plus_laion400m_finetune_EuroSAT.pt",
   "method": "theseus",
   "method_params": {
-    "num_batches": 10,
+    "num_batches": 1,
     "batch_size": 32,
     "seq_align": "interpolate2d",
     "split_qkv": true,
@@ -29,6 +29,6 @@
   "no_humanize": true,
   "weights": null,
   "tuned_ckpts": {
-    "MNIST": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_laion_finetune_MNIST.pt"
+    "EuroSAT": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/models/vitb16_laion_finetune_EuroSAT.pt"
   }
 }
