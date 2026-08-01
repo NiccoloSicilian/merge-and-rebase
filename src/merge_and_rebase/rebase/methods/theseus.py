@@ -821,6 +821,55 @@ def _iter_with_progress(iterable: Any, *, total: int, desc: str, enabled: bool) 
     return tqdm(iterable, total=total, desc=desc, leave=False)
 
 
+def _stratified_perm(
+    dataset: Any,
+    n_samples: int,
+    n_batches: int | None,
+    batch_size: int,
+    generator: torch.Generator,
+) -> torch.Tensor | None:
+    """Pick b*s/n_classes distinct samples per class, shuffled."""
+    from collections import defaultdict
+
+    # Get labels — try .targets first (torchvision), then HF column
+    targets = getattr(dataset, "targets", None)
+    if targets is None:
+        targets = getattr(dataset, "label", None)
+    if targets is None:
+        return None
+
+    if hasattr(targets, "tolist"):
+        labels = targets.tolist()[:n_samples]
+    elif isinstance(targets, list):
+        labels = targets[:n_samples]
+    else:
+        labels = [int(targets[i]) for i in range(n_samples)]
+
+    # Group indices by class
+    class_indices: dict[int, list[int]] = defaultdict(list)
+    for i, lbl in enumerate(labels):
+        class_indices[lbl].append(i)
+
+    n_classes = len(class_indices)
+    if n_classes < 2:
+        return None
+
+    total = n_samples if n_batches is None else min(n_samples, n_batches * batch_size)
+    per_class = max(1, total // n_classes)
+
+    selected: list[int] = []
+    for cls in sorted(class_indices.keys()):
+        pool = torch.tensor(class_indices[cls])
+        pool = pool[torch.randperm(len(pool), generator=generator)]
+        selected.extend(pool[:per_class].tolist())
+
+    perm = torch.tensor(selected)
+    perm = perm[torch.randperm(len(perm), generator=generator)]
+
+    print(f"[theseus] Balanced sampling: {len(perm)} samples, {per_class}/class, {n_classes} classes")
+    return perm
+
+
 def _iter_random_dataset_batches(
     source_dataloader: Iterable[Any],
     target_dataloader: Iterable[Any],
@@ -863,11 +912,15 @@ def _iter_random_dataset_batches(
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
-    perm = torch.randperm(n_samples, generator=generator)
 
-    if n_batches is not None:
-        max_items = min(n_samples, int(n_batches) * batch_size)
-        perm = perm[:max_items]
+    # Try stratified sampling: equal samples per class
+    perm = _stratified_perm(source_dataset, n_samples, n_batches, batch_size, generator)
+    if perm is None:
+        # Fallback to random
+        perm = torch.randperm(n_samples, generator=generator)
+        if n_batches is not None:
+            max_items = min(n_samples, int(n_batches) * batch_size)
+            perm = perm[:max_items]
 
     def _iterator() -> Iterable[tuple[Any, Any]]:
         for start in range(0, int(perm.numel()), batch_size):
