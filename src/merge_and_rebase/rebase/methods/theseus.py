@@ -307,13 +307,13 @@ class ActivationStore:
             self.h_b_list.append(b.float())
 
         if self.at_b is None:
-            self.at_b = a.T @ b
-            self.sum_a = a.sum(dim=0)
-            self.sum_b = b.sum(dim=0)
+            self.at_b = (a.T @ b).clone()
+            self.sum_a = a.sum(dim=0).clone()
+            self.sum_b = b.sum(dim=0).clone()
             if self.store_a_gram:
-                self.at_a = a.T @ a
+                self.at_a = (a.T @ a).clone()
             if self.store_b_gram:
-                self.bt_b = b.T @ b
+                self.bt_b = (b.T @ b).clone()
         else:
             self.at_b += a.T @ b
             self.sum_a += a.sum(dim=0)
