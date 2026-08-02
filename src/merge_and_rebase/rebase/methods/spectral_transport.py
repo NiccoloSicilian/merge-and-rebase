@@ -397,22 +397,47 @@ class SpectralTransport:
         spectral_transforms: dict[str, torch.Tensor] = {}
 
         if _fmap_path and os.path.isdir(_fmap_path):
+            # Load precomputed fmap components and derive spectral T
+            n_loaded = 0
             for fname in os.listdir(_fmap_path):
-                if fname.endswith(".pt"):
-                    layer_key = fname[:-3]
-                    spectral_transforms[layer_key] = torch.load(
-                        os.path.join(_fmap_path, fname),
-                        map_location="cpu", weights_only=False,
-                    )
+                if not fname.endswith(".pt"):
+                    continue
+                layer_key = fname[:-3]
+                fmap_data = torch.load(
+                    os.path.join(_fmap_path, fname),
+                    map_location="cpu", weights_only=False,
+                )
+                # New format: dict with C, eigvecs, etc.
+                if isinstance(fmap_data, dict) and "C" in fmap_data:
+                    # Need raw activations to compute spectral T
+                    store = activation_registry.get(layer_key)
+                    if store is not None:
+                        src_rows, tgt_rows = store.rows(center=False)
+                        if src_rows is not None and tgt_rows is not None:
+                            T = _compute_spectral_T(
+                                src_rows, tgt_rows,
+                                fmap_data["eigvecs1"].numpy(),
+                                fmap_data["eigvecs2"].numpy(),
+                                fmap_data["C"].numpy(),
+                                device=dev,
+                            )
+                            spectral_transforms[layer_key] = T
+                            n_loaded += 1
+                            if verbose:
+                                sim = fmap_data.get("similarity", 0.0)
+                                print(f"{log_prefix} {layer_key}: loaded fmap (sim={sim:.4f}) -> T={tuple(T.shape)}")
+                    else:
+                        if verbose:
+                            print(f"{log_prefix} {layer_key}: fmap loaded but no activations for spectral T")
+                else:
+                    # Legacy format: raw T tensor (from theseus fmap)
+                    spectral_transforms[layer_key] = fmap_data
+                    n_loaded += 1
             if verbose:
-                print(f"{log_prefix} prepare: loaded precomputed transforms ({len(spectral_transforms)} layers) from {_fmap_path}")
-        elif _fmap_path and os.path.isfile(_fmap_path):
-            spectral_transforms = torch.load(_fmap_path, map_location="cpu", weights_only=False)
-            if verbose:
-                print(f"{log_prefix} prepare: loaded precomputed transforms ({len(spectral_transforms)} layers) from {_fmap_path}")
+                print(f"{log_prefix} prepare: built spectral transforms for {n_loaded} layers from {_fmap_path}")
         else:
             if verbose:
-                print(f"{log_prefix} prepare: computing spectral transforms")
+                print(f"{log_prefix} prepare: computing spectral transforms from activations")
             spectral_transforms = _compute_spectral_transforms_from_activations(
                 activation_registry,
                 n_anchors_per_layer=n_real_samples_per_layer,
@@ -422,12 +447,6 @@ class SpectralTransport:
                 device=device,
                 verbose=bool(verbose),
             )
-            if _fmap_path:
-                os.makedirs(_fmap_path, exist_ok=True)
-                for layer_key, T_mat in spectral_transforms.items():
-                    torch.save(T_mat, os.path.join(_fmap_path, f"{layer_key}.pt"))
-                if verbose:
-                    print(f"{log_prefix} prepare: saved transforms to {_fmap_path}")
 
         if verbose:
             print(f"{log_prefix} prepare: spectral transforms for {len(spectral_transforms)} layers")

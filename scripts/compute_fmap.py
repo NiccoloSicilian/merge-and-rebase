@@ -1,4 +1,7 @@
-"""Compute functional map T matrices from cached activations.
+"""Compute functional map components from cached activations.
+
+Saves per-layer: C, eigvecs, eigvals, T_procrustes, and similarity.
+The spectral transport method can load C + eigvecs directly.
 
 Usage:
     python scripts/compute_fmap.py ACTIVATIONS_PATH --source-model ViT-B-16 --target-model ViT-B-16-plus-240 [OPTIONS]
@@ -17,7 +20,7 @@ Usage:
 
 Output structure:
     {output-dir}/{source}_{target}_eigs{E}_k{K}/
-        transformer.resblocks.0.attn.q_proj.in.pt
+        transformer.resblocks.0.attn.q_proj.in.pt   (dict with C, eigvecs1, eigvecs2, eigvals1, eigvals2, T, similarity)
         transformer.resblocks.0.attn.q_proj.out.pt
         ...
 """
@@ -32,7 +35,7 @@ import torch
 
 # Add src to path so we can import fmap_utils
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from merge_and_rebase.rebase.methods.fmap_utils import FM_T
+from merge_and_rebase.rebase.methods.fmap_utils.fm_estimator import FM
 
 _DEFAULT_FMAP_DIR = "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/fmaps"
 
@@ -132,11 +135,10 @@ def main():
 
         t0 = time.time()
         try:
-            fmap = FM_T(
+            fmap = FM(
                 src.double(),
                 tgt.double(),
                 anchors,
-                transformation="orthogonal",
                 num_eigs=n_eig,
                 graph_algo="knn",
                 graph_similarity="angular",
@@ -148,18 +150,30 @@ def main():
                 refine=True,
                 device=dev,
             )
-            T = fmap.T
-            if isinstance(T, torch.Tensor):
-                T_save = T.float().cpu()
-            else:
-                T_save = torch.tensor(np.array(T), dtype=torch.float32)
-
-            torch.save(T_save, out_file)
-            n_saved += 1
 
             sim = fmap.get_similarity()
+
+            # Convert all components to float32 tensors for saving
+            C_save = torch.tensor(np.asarray(fmap.C), dtype=torch.float32)
+            eigvecs1_save = torch.tensor(np.asarray(fmap.eigvecs1), dtype=torch.float32)
+            eigvecs2_save = torch.tensor(np.asarray(fmap.eigvecs2), dtype=torch.float32)
+            eigvals1_save = torch.tensor(np.asarray(fmap.eigvals1), dtype=torch.float32)
+            eigvals2_save = torch.tensor(np.asarray(fmap.eigvals2), dtype=torch.float32)
+
+            save_dict = {
+                "C": C_save,
+                "eigvecs1": eigvecs1_save,
+                "eigvecs2": eigvecs2_save,
+                "eigvals1": eigvals1_save,
+                "eigvals2": eigvals2_save,
+                "similarity": sim,
+            }
+
+            torch.save(save_dict, out_file)
+            n_saved += 1
+
             dt = time.time() - t0
-            print(f"  -> T={tuple(T_save.shape)} similarity={sim:.4f} ({dt:.1f}s) saved to {out_file}")
+            print(f"  -> C={tuple(C_save.shape)} similarity={sim:.4f} ({dt:.1f}s) saved to {out_file}")
         except Exception as exc:
             print(f"  -> FAILED: {exc}")
 
