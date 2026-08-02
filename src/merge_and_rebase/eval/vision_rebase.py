@@ -286,7 +286,7 @@ def main() -> None:
         method = get_method(method_name)
         method_label = format_rebase_method_label(method_name, method_params)
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
-        theseus_like_method = method_name in {"theseus", "theseus_reference"}
+        theseus_like_method = method_name in {"theseus", "theseus_reference", "spectral"}
         blockext_like_method = method_name in {"theseus", "theseus_reference", "bico", "bico_gradin"}
         transfusion_mode = method_name == "transfusion"
         bico_mode = method_name in ("bico", "bico_gradin")
