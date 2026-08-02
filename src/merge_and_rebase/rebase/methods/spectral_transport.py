@@ -105,6 +105,7 @@ def _compute_spectral_transforms_from_activations(
     *,
     n_anchors_per_layer: dict[str, int] | None = None,
     n_anchors: int | None = None,
+    n_spectral_samples: int | None = None,
     num_eigs: int = 50,
     k_graph: int | None = None,
     device: str | torch.device = "cpu",
@@ -192,10 +193,23 @@ def _compute_spectral_transforms_from_activations(
                 c_shape = np.array(fmap.C).shape
                 print(f"{log_prefix} {key}: fmap C={c_shape} similarity={sim:.4f}")
 
-            # Compute spectral T
+            # Compute spectral T — use only real samples (exclude interpolated)
+            n_use = n_spectral_samples
+            if n_use is None and n_anchors_per_layer is not None and key in n_anchors_per_layer:
+                n_use = n_anchors_per_layer[key]
+            if n_use is not None and n_use < n_samples:
+                src_for_T = src_rows[:n_use]
+                tgt_for_T = tgt_rows[:n_use]
+                eigvecs1_for_T = fmap.eigvecs1[:n_use]
+                eigvecs2_for_T = fmap.eigvecs2[:n_use]
+            else:
+                src_for_T = src_rows
+                tgt_for_T = tgt_rows
+                eigvecs1_for_T = fmap.eigvecs1
+                eigvecs2_for_T = fmap.eigvecs2
             T = _compute_spectral_T(
-                src_rows, tgt_rows,
-                fmap.eigvecs1, fmap.eigvecs2,
+                src_for_T, tgt_for_T,
+                eigvecs1_for_T, eigvecs2_for_T,
                 fmap.C, device=dev,
             )
             transforms[key] = T
@@ -321,6 +335,7 @@ class SpectralTransport:
         num_eigs: int = 50,
         k_graph: int | None = None,
         n_anchors: int | None = None,
+        n_spectral_samples: int | None = None,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -414,10 +429,19 @@ class SpectralTransport:
                     if store is not None:
                         src_rows, tgt_rows = store.rows(center=False)
                         if src_rows is not None and tgt_rows is not None:
+                            # Use only real samples (exclude interpolated)
+                            n_use = n_spectral_samples
+                            if n_use is None:
+                                n_real = n_real_samples_per_layer.get(layer_key)
+                                if n_real is not None:
+                                    n_use = n_real
+                            if n_use is not None and n_use < src_rows.shape[0]:
+                                src_rows = src_rows[:n_use]
+                                tgt_rows = tgt_rows[:n_use]
                             T = _compute_spectral_T(
                                 src_rows, tgt_rows,
-                                fmap_data["eigvecs1"].numpy(),
-                                fmap_data["eigvecs2"].numpy(),
+                                fmap_data["eigvecs1"].numpy()[:n_use] if n_use is not None else fmap_data["eigvecs1"].numpy(),
+                                fmap_data["eigvecs2"].numpy()[:n_use] if n_use is not None else fmap_data["eigvecs2"].numpy(),
                                 fmap_data["C"].numpy(),
                                 device=dev,
                             )
@@ -425,7 +449,8 @@ class SpectralTransport:
                             n_loaded += 1
                             if verbose:
                                 sim = fmap_data.get("similarity", 0.0)
-                                print(f"{log_prefix} {layer_key}: loaded fmap (sim={sim:.4f}) -> T={tuple(T.shape)}")
+                                n_pts = src_rows.shape[0]
+                                print(f"{log_prefix} {layer_key}: loaded fmap (sim={sim:.4f}) samples={n_pts} -> T={tuple(T.shape)}")
                     else:
                         if verbose:
                             print(f"{log_prefix} {layer_key}: fmap loaded but no activations for spectral T")
@@ -442,6 +467,7 @@ class SpectralTransport:
                 activation_registry,
                 n_anchors_per_layer=n_real_samples_per_layer,
                 n_anchors=n_anchors,
+                n_spectral_samples=n_spectral_samples,
                 num_eigs=int(num_eigs),
                 k_graph=k_graph,
                 device=device,
@@ -577,6 +603,7 @@ class SpectralTransport:
         num_eigs: int = 50,
         k_graph: int | None = None,
         n_anchors: int | None = None,
+        n_spectral_samples: int | None = None,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         prepared: Mapping[str, Any] | None = None,
@@ -615,6 +642,7 @@ class SpectralTransport:
                 num_eigs=int(num_eigs),
                 k_graph=k_graph,
                 n_anchors=n_anchors,
+                n_spectral_samples=n_spectral_samples,
                 activations_path=activations_path,
                 fmap_transforms_path=fmap_transforms_path,
                 verbose=bool(verbose),
