@@ -285,7 +285,9 @@ def _precompute_spectral_transforms(
                     transforms_by_key[key] = _LayerTransform(kind="bias", t_out=weight_transform.t_out)
                     continue
 
-            t_out = t_out_cache.get(out_key) or spectral_transforms.get(out_key)
+            t_out = t_out_cache.get(out_key)
+            if t_out is None:
+                t_out = spectral_transforms.get(out_key)
             if t_out is not None:
                 t_out_cache[out_key] = t_out
                 transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
