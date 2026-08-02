@@ -62,6 +62,7 @@ def main():
     p.add_argument("--layer-name", type=str, default=None, help="Compute only this layer by name")
     p.add_argument("--num-eigs", type=int, default=50)
     p.add_argument("--k-graph", type=int, default=None, help="KNN neighbors (default: 7%% of samples)")
+    p.add_argument("--n-anchors", type=int, default=None, help="Number of anchors (default: all real samples)")
     p.add_argument("--min-dim", type=int, default=10, help="Skip layers with feature dim < this")
     p.add_argument("--max-samples", type=int, default=100000, help="Skip layers with more samples than this")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -116,7 +117,13 @@ def main():
             continue
 
         n_anch = min(n_real, n_samples)
-        anchors = torch.stack([torch.arange(n_anch), torch.arange(n_anch)], dim=1)
+        if args.n_anchors is not None and args.n_anchors < n_anch:
+            perm = torch.randperm(n_anch)[:args.n_anchors]
+            perm, _ = perm.sort()
+            anchors = torch.stack([perm, perm], dim=1)
+            n_anch = args.n_anchors
+        else:
+            anchors = torch.stack([torch.arange(n_anch), torch.arange(n_anch)], dim=1)
         n_eig = min(args.num_eigs, n_samples - 1)
         k_eff = args.k_graph if args.k_graph is not None else max(int(n_samples * 0.07), 5)
 
