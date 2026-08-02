@@ -1230,6 +1230,7 @@ class TheseusRebase:
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
         activations_path: str | None = None,
+        fmap_transforms_path: str | None = None,
         verbose: bool = True,
         show_progress: bool = True,
         **kwargs,
@@ -1358,18 +1359,42 @@ class TheseusRebase:
                         _save_activation_registry(activation_registry, _act_path, n_real_samples_per_layer)
 
                 if use_fmap:
+                    _fmap_path = fmap_transforms_path if fmap_transforms_path else None
+                    if _fmap_path and os.path.isdir(_fmap_path):
+                        # Load per-layer .pt files from directory
+                        fmap_transforms = {}
+                        for fname in os.listdir(_fmap_path):
+                            if fname.endswith(".pt"):
+                                layer_key = fname[:-3]  # strip .pt
+                                fmap_transforms[layer_key] = torch.load(
+                                    os.path.join(_fmap_path, fname),
+                                    map_location="cpu", weights_only=False,
+                                )
+                        if verbose:
+                            print(f"{log_prefix} prepare: loaded precomputed fmap transforms ({len(fmap_transforms)} layers) from {_fmap_path}")
+                    elif _fmap_path and os.path.isfile(_fmap_path):
+                        fmap_transforms = torch.load(_fmap_path, map_location="cpu", weights_only=False)
+                        if verbose:
+                            print(f"{log_prefix} prepare: loaded precomputed fmap transforms ({len(fmap_transforms)} layers) from {_fmap_path}")
+                    else:
+                        if verbose:
+                            print(f"{log_prefix} prepare: computing functional maps")
+                        fmap_transforms = _compute_fmap_from_activations(
+                            activation_registry,
+                            n_anchors_per_layer=n_real_samples_per_layer,
+                            num_eigs=int(fmap_num_eigs),
+                            k_graph=fmap_k_graph,
+                            device=device,
+                            verbose=bool(verbose),
+                        )
+                        if _fmap_path:
+                            os.makedirs(_fmap_path, exist_ok=True)
+                            for layer_key, T_mat in fmap_transforms.items():
+                                torch.save(T_mat, os.path.join(_fmap_path, f"{layer_key}.pt"))
+                            if verbose:
+                                print(f"{log_prefix} prepare: saved fmap transforms to {_fmap_path}")
                     if verbose:
-                        print(f"{log_prefix} prepare: computing functional maps")
-                    fmap_transforms = _compute_fmap_from_activations(
-                        activation_registry,
-                        n_anchors_per_layer=n_real_samples_per_layer,
-                        num_eigs=int(fmap_num_eigs),
-                        k_graph=fmap_k_graph,
-                        device=device,
-                        verbose=bool(verbose),
-                    )
-                    if verbose:
-                        print(f"{log_prefix} prepare: fmap transforms computed for {len(fmap_transforms)} layers")
+                        print(f"{log_prefix} prepare: fmap transforms for {len(fmap_transforms)} layers")
 
             elif verbose:
                 print(f"{log_prefix} prepare: skipping activation collection (data-free covariance mode)")
@@ -1558,6 +1583,7 @@ class TheseusRebase:
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
         activations_path: str | None = None,
+        fmap_transforms_path: str | None = None,
         verbose: bool = True,
         show_progress: bool = True,
         **kwargs,
@@ -1599,8 +1625,9 @@ class TheseusRebase:
                 n_interpolations=int(n_interpolations),
                 use_fmap=bool(use_fmap),
                 fmap_num_eigs=int(fmap_num_eigs),
-                fmap_k_graph=int(fmap_k_graph),
+                fmap_k_graph=fmap_k_graph,
                 activations_path=activations_path,
+                fmap_transforms_path=fmap_transforms_path,
                 verbose=bool(verbose),
                 show_progress=bool(show_progress),
                 **kwargs,
