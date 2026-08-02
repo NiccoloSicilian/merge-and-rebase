@@ -60,6 +60,7 @@ def main():
                    help=f"Base output directory (default: {_DEFAULT_FMAP_DIR})")
     p.add_argument("--layer-index", type=int, default=None, help="Compute only this layer index")
     p.add_argument("--layer-name", type=str, default=None, help="Compute only this layer by name")
+    p.add_argument("--force", action="store_true", help="Recompute even if layer file already exists")
     p.add_argument("--num-eigs", type=int, default=50)
     p.add_argument("--k-graph", type=int, default=None, help="KNN neighbors (default: 7%% of samples)")
     p.add_argument("--min-dim", type=int, default=10, help="Skip layers with feature dim < this")
@@ -99,8 +100,8 @@ def main():
     for i, key in enumerate(keys):
         # Skip if already computed
         out_file = os.path.join(run_dir, _sanitize_layer_name(key) + ".pt")
-        if os.path.isfile(out_file):
-            print(f"[{i+1}/{len(keys)}] {key}: already exists, skipping")
+        if os.path.isfile(out_file) and not args.force:
+            print(f"[{i+1}/{len(keys)}] {key}: already exists, skipping (use --force to recompute)")
             n_saved += 1
             continue
 
