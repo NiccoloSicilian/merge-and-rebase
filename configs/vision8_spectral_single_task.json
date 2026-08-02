@@ -16,7 +16,7 @@
     "n_interpolations": 6500,
     "num_eigs": 30,
     "n_anchors": 100,
-    "n_spectral_samples": 32,
+    "n_spectral_samples": 226,
     "activations_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/activations_cache/theseus_MNIST_vitb16_vitb16plus_1b32s6500i.pt",
     "fmap_transforms_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/fmaps/vit-b-16_vit-b-16-plus-240_eigs30_kauto"
   },
