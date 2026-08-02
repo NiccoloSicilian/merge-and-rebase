@@ -14,9 +14,9 @@
     "seq_align": "interpolate2d",
     "split_qkv": true,
     "center_acts": false,
-    "n_interpolations": 1500,
+    "n_interpolations": 5500,
     "use_fmap": true,
-    "activations_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/activations_cache/theseus_MNIST_vitb16_vitb16plus_1b10s1500i.pt",
+    "activations_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/activations_cache/theseus_MNIST_vitb16_vitb16plus_1b10s2500i.pt",
     "fmap_transforms_path": "/leonardo_scratch/fast/IscrC_eff-SAM2/HeterogeneousMerging/fmaps/vit-b-16_vit-b-16-plus-240_eigs50_kauto"
   },
   "alpha_search": true,
