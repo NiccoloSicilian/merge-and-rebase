@@ -16,7 +16,7 @@
     "center_acts": false,
     "n_interpolations": 0,
     "use_fmap": false,
-    "activations_path": "/home/stud/sici/storage/user/Theseus/activations_cache/theseus_MNIST_vitb16plus_to_vitb16datacomp_raw_1b32_ftacts.pt",
+    "activations_path": "",
     "covariance_mode": "activations",
     "whiten_power": 0.0
   },
