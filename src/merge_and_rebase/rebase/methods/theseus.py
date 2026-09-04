@@ -546,11 +546,46 @@ def _load_activation_registry(path: str) -> tuple[dict[str, ActivationStore], di
     return registry, n_real
 
 
+def _slerp_rows(a: torch.Tensor, b: torch.Tensor, t: torch.Tensor, *, eps: float = 1e-7) -> torch.Tensor:
+    """Spherical interpolation between corresponding rows of a and b.
+
+    Activations are not unit norm, so the direction is interpolated on the unit
+    sphere while the magnitude is interpolated linearly. Rows whose directions
+    are (anti)parallel, or which have a vanishing norm, fall back to the linear
+    path, where slerp is undefined.
+    """
+    a = a.to(torch.float32)
+    b = b.to(torch.float32)
+    na = a.norm(dim=1, keepdim=True)
+    nb = b.norm(dim=1, keepdim=True)
+
+    ua = a / na.clamp_min(eps)
+    ub = b / nb.clamp_min(eps)
+
+    cos = (ua * ub).sum(dim=1, keepdim=True).clamp(-1.0 + eps, 1.0 - eps)
+    omega = torch.acos(cos)
+    sin_omega = torch.sin(omega)
+
+    coef_a = torch.sin((1.0 - t) * omega) / sin_omega
+    coef_b = torch.sin(t * omega) / sin_omega
+    direction = coef_a * ua + coef_b * ub
+
+    # magnitude moves linearly; direction moves along the great circle
+    out = direction * ((1.0 - t) * na + t * nb)
+
+    degenerate = (sin_omega.abs() < eps) | (na < eps) | (nb < eps)
+    if degenerate.any():
+        linear = (1.0 - t) * a + t * b
+        out = torch.where(degenerate, linear, out)
+    return out
+
+
 def _augment_registry_with_interpolations(
     registry: dict[str, ActivationStore],
     *,
     n_interpolations: int,
     seed: int = 0,
+    interp_mode: str = "linear",
 ) -> dict[str, ActivationStore]:
     """Augment activation stores with interpolated points.
 
@@ -560,7 +595,18 @@ def _augment_registry_with_interpolations(
         tgt_interp = (1 - t) * tgt[j] + t * tgt[k]
     where t is sampled uniformly from (0, 1).  The interpolated pairs are fed
     back into the same ActivationStore so they contribute to the cross-covariance.
+
+    interp_mode selects the path between the two points:
+      "linear" -- straight line in activation space (default)
+      "slerp"  -- great-circle in direction, linear in magnitude
+
+    Source and target share the pair indices (j, k) and the coefficient t, which
+    is what keeps the two new points in correspondence. Note that under slerp the
+    resulting blend weights differ per side, because the angle between src[j] and
+    src[k] is not the angle between tgt[j] and tgt[k].
     """
+    if interp_mode not in {"linear", "slerp"}:
+        raise ValueError(f"interp_mode must be 'linear' or 'slerp', got {interp_mode!r}")
     rng = torch.Generator().manual_seed(seed)
 
     for key, store in registry.items():
@@ -582,8 +628,12 @@ def _augment_registry_with_interpolations(
 
         t = torch.rand(n_interpolations, 1, generator=rng)
 
-        src_interp = (1.0 - t) * src_rows[idx_j] + t * src_rows[idx_k]
-        tgt_interp = (1.0 - t) * tgt_rows[idx_j] + t * tgt_rows[idx_k]
+        if interp_mode == "slerp":
+            src_interp = _slerp_rows(src_rows[idx_j], src_rows[idx_k], t)
+            tgt_interp = _slerp_rows(tgt_rows[idx_j], tgt_rows[idx_k], t)
+        else:
+            src_interp = (1.0 - t) * src_rows[idx_j] + t * src_rows[idx_k]
+            tgt_interp = (1.0 - t) * tgt_rows[idx_j] + t * tgt_rows[idx_k]
 
         store.update(src_interp, tgt_interp)
 
@@ -1226,6 +1276,7 @@ class TheseusRebase:
         batch_size: int | None = None,
         patch_qkv: bool = True,
         n_interpolations: int = 0,
+        interp_mode: str = "linear",
         use_fmap: bool = False,
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
@@ -1348,11 +1399,12 @@ class TheseusRebase:
                             activation_registry,
                             n_interpolations=n_interpolations,
                             seed=int(seed),
+                            interp_mode=str(interp_mode),
                         )
                         if verbose:
                             sample_store = next(iter(activation_registry.values()), None)
                             n_total = sample_store.n_samples if sample_store else 0
-                            print(f"{log_prefix} prepare: augmented with {n_interpolations} interpolations (total samples per layer: {n_total})")
+                            print(f"{log_prefix} prepare: augmented with {n_interpolations} {interp_mode} interpolations (total samples per layer: {n_total})")
 
                     # Save to disk for reuse
                     if _act_path:
@@ -1579,6 +1631,7 @@ class TheseusRebase:
         batch_size: int | None = None,
         patch_qkv: bool = True,
         n_interpolations: int = 0,
+        interp_mode: str = "linear",
         use_fmap: bool = False,
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
@@ -1623,6 +1676,7 @@ class TheseusRebase:
                 batch_size=batch_size,
                 patch_qkv=patch_qkv,
                 n_interpolations=int(n_interpolations),
+                interp_mode=str(interp_mode),
                 use_fmap=bool(use_fmap),
                 fmap_num_eigs=int(fmap_num_eigs),
                 fmap_k_graph=fmap_k_graph,
