@@ -1,6 +1,6 @@
 {
   "suite": "vision8",
-  "tasks": "GTSRB",
+  "tasks": "MNIST",
   "source_clip_model": "ViT-Mini-Plus",
   "source_clip_pretrained": "/home/stud/sici/storage/user/Theseus/models/vitminiplus_pretrain.pt",
   "target_clip_model": "ViT-Mini",
@@ -35,6 +35,6 @@
   "no_humanize": true,
   "weights": null,
   "tuned_ckpts": {
-    "GTSRB": "/home/stud/sici/storage/user/Theseus/models/finetuned/vitminiplus_mini_plus_finetune_GTSRB.pt"
+    "MNIST": "/home/stud/sici/storage/user/Theseus/models/finetuned/vitminiplus_mini_plus_finetune_MNIST.pt"
   }
 }
