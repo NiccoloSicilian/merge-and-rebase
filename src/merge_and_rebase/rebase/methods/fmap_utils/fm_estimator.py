@@ -83,10 +83,10 @@ class FM:
                 Dx_inv = np.diag(1 / np.diag(Dx + 1e-8))
                 self.CO = Dx_inv @ self.C.T @ Dy @ self.C
 
-            self.Phi_flat = FM_to_p2p(self.C, self.eigvecs1, self.eigvecs2, use_adj=False, n_jobs=1)  # (n1,), indices of the closest point in the first shape for each point in the second shape
+            self.Phi_flat = FM_to_p2p(self.C, self.eigvecs1, self.eigvecs2, use_adj=False, n_jobs=1)  # (n2,) p2p_21: Y[i] <-> X[Phi_flat[i]]
             # compute the transformation matrix
             if self.transformation == 'linear':
-                self.T = torch.linalg.lstsq(self.X, self.Y[self.Phi_flat]).solution
+                self.T = torch.linalg.lstsq(self.X[self.Phi_flat], self.Y).solution
         else:
             self.compute_descriptors(n_descr)
             self.fit(refine=refine)
@@ -204,7 +204,9 @@ class FM_T(FM):
 
     def fit(self, refine=True, nit=10):
         super().fit(refine=refine, nit=nit)
-        self.Phi_flat = FM_to_p2p(self.C, self.eigvecs1, self.eigvecs2,  use_adj=False, n_jobs=1, device=self.device) # (n1,), indices of the closest point in the first shape for each point in the second shape
+        # (n2,) -- p2p_21: point i of Y corresponds to point Phi_flat[i] of X.
+        # The entries index X, the positions index Y.
+        self.Phi_flat = FM_to_p2p(self.C, self.eigvecs1, self.eigvecs2,  use_adj=False, n_jobs=1, device=self.device)
 
         # ensure X and Y are torch tensors on the right device
         dev = self.device if self.device is not None else 'cpu'
@@ -213,13 +215,17 @@ class FM_T(FM):
         X_t = X_t.to(dev)
         Y_t = Y_t.to(dev)
 
-        # compute the transformation matrix
+        # compute the transformation matrix.
+        # Phi_flat is p2p_21, so the matched pairs are (X[Phi_flat[i]], Y[i]):
+        # gather on X, not on Y. Indexing Y with these entries pairs points that
+        # do not correspond -- and never raises, because n1 == n2 whenever both
+        # sides are sampled from the same batch.
         if self.transformation == 'linear':
-            self.T = torch.linalg.lstsq(X_t, Y_t[self.Phi_flat]).solution
+            self.T = torch.linalg.lstsq(X_t[self.Phi_flat], Y_t).solution
         elif self.transformation == 'orthogonal':
-            # Procrustes: min ||X @ T - Y[Phi]||_F  s.t. T.T @ T = I
-            # Solution: T = V @ U.T  where  Y[Phi].T @ X = U @ S @ V.T
-            M = Y_t[self.Phi_flat].T @ X_t
+            # Procrustes: min ||X[Phi] @ T - Y||_F  s.t. T.T @ T = I
+            # Solution: T = V @ U.T  where  Y.T @ X[Phi] = U @ S @ V.T
+            M = Y_t.T @ X_t[self.Phi_flat]
             U, S, Vh = torch.linalg.svd(M, full_matrices=False)
             if self.rank is not None:
                 U  = U[:, :self.rank]
