@@ -669,6 +669,7 @@ def _compute_fmap_from_activations(
     single-source shortest path per side, and one descriptor column.
     """
     from .fmap_utils import FM_T
+    from .fmap_utils.graph import build_graph
 
     dev = torch.device(device) if isinstance(device, str) else device
     log_prefix = "[theseus-fmap]"
@@ -738,6 +739,40 @@ def _compute_fmap_from_activations(
             )
 
         try:
+            # Build the two graphs up front so a degenerate one can be caught.
+            # A disconnected kNN graph means duplicate or near-duplicate rows
+            # (identical class-token embeddings, say) left nodes with no edge
+            # under the distance kernel; the eigendecomposition that FM_T runs
+            # next then dies with a hard segfault, taking the whole job with it.
+            # Skipping the layer leaves it to the Procrustes fallback.
+            graphs = []
+            disconnected = []
+            for side, rows_np in (("src", x_np), ("tgt", y_np)):
+                g = build_graph(
+                    torch.tensor(rows_np, dtype=torch.float64),
+                    algo="knn",
+                    kernel="distance",
+                    similarity="angular",
+                    m=3,
+                    k=k_eff,
+                    device=dev,
+                )
+                if not g.G.isconnected():
+                    disconnected.append(side)
+                graphs.append(g)
+
+            if disconnected:
+                print(
+                    f"{log_prefix} {key}: skipped (disconnected graph: "
+                    f"{', '.join(disconnected)}; k={k_eff}) — Procrustes fallback"
+                )
+                store.h_a_list.clear()
+                store.h_b_list.clear()
+                continue
+
+            for g in graphs:
+                g.eigvals, g.eigvecs = g.eigen_decomp(k=n_eig)
+
             fmap = FM_T(
                 torch.tensor(x_np, dtype=torch.float64),
                 torch.tensor(y_np, dtype=torch.float64),
@@ -753,6 +788,7 @@ def _compute_fmap_from_activations(
                 compute_gt_map=False,
                 refine=True,
                 device=dev,
+                graphs=tuple(graphs),
             )
             # fmap.T: (d_src, d_tgt) — same convention as Procrustes maps
             T = fmap.T
