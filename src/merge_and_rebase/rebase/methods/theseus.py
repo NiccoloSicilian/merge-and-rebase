@@ -778,19 +778,20 @@ def _compute_fmap_from_activations(
                 g_sim = build_graph(rows_t, kernel="gaussian", **common)
                 g_dist = build_graph(rows_t, kernel="distance", **common)
 
-                # Connectivity of the affinity graph is the crash condition:
-                # eigendecomposing a disconnected one segfaults. Identical rows
-                # (MNIST's uniform background patches) weigh 1 here instead of
-                # the 0 a distance kernel gives them, so they no longer isolate.
-                is_conn = bool(g_sim.G.isconnected())
-                connectivity.append(f"{side}={is_conn}")
-                if not is_conn:
-                    disconnected.append(side)
-                # Reachability of the distance graph only degrades descriptor
-                # quality (unreachable anchors give exp(-inf)=0), so report it
-                # without discarding the layer.
-                if verbose and not g_dist.G.isconnected():
-                    print(f"{log_prefix} {key}: note — {side} geodesic graph is disconnected")
+                # Both graphs have to be connected. A disconnected affinity
+                # graph segfaults the eigendecomposition; a disconnected
+                # distance graph segfaults the geodesic shortest paths, which
+                # is what conv1.out hits -- identical rows (MNIST's uniform
+                # background patches) sit at distance 0, and a zero-weight edge
+                # is dropped from the sparse matrix, isolating the node. The
+                # gaussian kernel rescues the first case but not the second.
+                sim_conn = bool(g_sim.G.isconnected())
+                dist_conn = bool(g_dist.G.isconnected())
+                connectivity.append(f"{side}=affinity:{sim_conn}/geodesic:{dist_conn}")
+                if not sim_conn:
+                    disconnected.append(f"{side}:affinity")
+                if not dist_conn:
+                    disconnected.append(f"{side}:geodesic")
                 graphs.append((g_sim, g_dist))
 
             # FM prints this itself when it builds its own graphs; passing them
