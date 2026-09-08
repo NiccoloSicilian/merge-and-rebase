@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -648,20 +649,36 @@ def _compute_fmap_from_activations(
     k_graph: int | None = None,
     device: str | torch.device = "cpu",
     verbose: bool = True,
+    save_dir: str | None = None,
+    precomputed: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute functional maps and return orthogonal T matrices per registry key.
 
     fmap.T has shape (d_src, d_tgt) — same convention as the Procrustes
     alignment maps used by ``_precompute_transforms``, so the returned
     tensors can directly replace them as ``t_in`` / ``t_out``.
+
+    ``save_dir`` writes each layer's T to ``<save_dir>/<key>.pt`` as soon as it
+    is computed, so a job that dies part-way keeps the layers it finished.
+    ``precomputed`` holds maps recovered from a previous run; those layers are
+    reused instead of recomputed.
     """
     from .fmap_utils import FM_T
 
     dev = torch.device(device) if isinstance(device, str) else device
     log_prefix = "[theseus-fmap]"
-    fmap_transforms: dict[str, torch.Tensor] = {}
+    fmap_transforms: dict[str, torch.Tensor] = dict(precomputed or {})
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
 
     for key, store in activation_registry.items():
+        if key in fmap_transforms:
+            if verbose:
+                print(f"{log_prefix} {key}: reusing cached map T={tuple(fmap_transforms[key].shape)}")
+            store.h_a_list.clear()
+            store.h_b_list.clear()
+            continue
+
         src_rows, tgt_rows = store.rows(center=False)
         if src_rows is None or tgt_rows is None:
             if verbose:
@@ -730,12 +747,16 @@ def _compute_fmap_from_activations(
             else:
                 fmap_transforms[key] = torch.tensor(np.array(T), dtype=torch.float32)
 
+            if save_dir:
+                torch.save(fmap_transforms[key], os.path.join(save_dir, f"{key}.pt"))
+
             sim = fmap.get_similarity()
             c_shape = np.array(fmap.C).shape
             print(
                 f"{log_prefix} {key}: fmap computed  "
                 f"C={c_shape}  T={tuple(fmap_transforms[key].shape)}  "
                 f"similarity={sim:.4f}"
+                + (f"  saved -> {key}.pt" if save_dir else "")
             )
         except Exception as exc:
             print(f"{log_prefix} {key}: fmap computation failed — {exc}")
@@ -1356,7 +1377,6 @@ class TheseusRebase:
         unpatched_target = 0
         try:
             if covariance_mode == "activations":
-                import os
                 _act_path = activations_path if activations_path else None
 
                 if _act_path and os.path.isfile(_act_path):
@@ -1412,25 +1432,28 @@ class TheseusRebase:
 
                 if use_fmap:
                     _fmap_path = fmap_transforms_path if fmap_transforms_path else None
-                    if _fmap_path and os.path.isdir(_fmap_path):
-                        # Load per-layer .pt files from directory
-                        fmap_transforms = {}
-                        for fname in os.listdir(_fmap_path):
-                            if fname.endswith(".pt"):
-                                layer_key = fname[:-3]  # strip .pt
-                                fmap_transforms[layer_key] = torch.load(
-                                    os.path.join(_fmap_path, fname),
-                                    map_location="cpu", weights_only=False,
-                                )
-                        if verbose:
-                            print(f"{log_prefix} prepare: loaded precomputed fmap transforms ({len(fmap_transforms)} layers) from {_fmap_path}")
-                    elif _fmap_path and os.path.isfile(_fmap_path):
+                    if _fmap_path and os.path.isfile(_fmap_path):
                         fmap_transforms = torch.load(_fmap_path, map_location="cpu", weights_only=False)
                         if verbose:
                             print(f"{log_prefix} prepare: loaded precomputed fmap transforms ({len(fmap_transforms)} layers) from {_fmap_path}")
                     else:
+                        # A directory may hold a complete cache or the layers a
+                        # previous run finished before dying; either way the
+                        # missing layers are recomputed below.
+                        cached: dict[str, torch.Tensor] = {}
+                        if _fmap_path and os.path.isdir(_fmap_path):
+                            for fname in os.listdir(_fmap_path):
+                                if fname.endswith(".pt"):
+                                    layer_key = fname[:-3]  # strip .pt
+                                    cached[layer_key] = torch.load(
+                                        os.path.join(_fmap_path, fname),
+                                        map_location="cpu", weights_only=False,
+                                    )
+                            if verbose:
+                                print(f"{log_prefix} prepare: loaded {len(cached)} cached fmap transforms from {_fmap_path}")
+                        n_missing = sum(1 for key in activation_registry if key not in cached)
                         if verbose:
-                            print(f"{log_prefix} prepare: computing functional maps")
+                            print(f"{log_prefix} prepare: computing functional maps ({n_missing} layers to go)")
                         fmap_transforms = _compute_fmap_from_activations(
                             activation_registry,
                             n_anchors_per_layer=n_real_samples_per_layer,
@@ -1438,13 +1461,11 @@ class TheseusRebase:
                             k_graph=fmap_k_graph,
                             device=device,
                             verbose=bool(verbose),
+                            save_dir=_fmap_path,
+                            precomputed=cached,
                         )
-                        if _fmap_path:
-                            os.makedirs(_fmap_path, exist_ok=True)
-                            for layer_key, T_mat in fmap_transforms.items():
-                                torch.save(T_mat, os.path.join(_fmap_path, f"{layer_key}.pt"))
-                            if verbose:
-                                print(f"{log_prefix} prepare: saved fmap transforms to {_fmap_path}")
+                        if _fmap_path and verbose:
+                            print(f"{log_prefix} prepare: fmap transforms saved under {_fmap_path}")
                     if verbose:
                         print(f"{log_prefix} prepare: fmap transforms for {len(fmap_transforms)} layers")
 
