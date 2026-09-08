@@ -74,6 +74,10 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# open_clip model configs shipped with the repo (ViT-Mini / ViT-Mini-Plus)
+"merge_and_rebase.models" = ["openclip_model_configs/*.json"]
+
 [tool.ruff]
 target-version = "py312"
 line-length = 120

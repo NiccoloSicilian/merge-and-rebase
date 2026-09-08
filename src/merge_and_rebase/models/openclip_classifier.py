@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .local_openclip_configs import register_local_openclip_configs
+
 
 @dataclass(frozen=True)
 class OpenClipBuildConfig:
@@ -179,6 +181,8 @@ class OpenClipClassifier(nn.Module):
             except Exception as e:
                 raise ImportError("openai clip support also requires: pip install -e '.[openclip]'") from e
 
+            register_local_openclip_configs()
+
             openai_model_name = _resolve_openai_clip_model_name(str(cfg.model_name).strip())
             model, preprocess = clip.load(openai_model_name, device=cfg.device, jit=False)
             openclip_model_name = str(cfg.model_name).strip()
@@ -205,6 +209,8 @@ class OpenClipClassifier(nn.Module):
             import open_clip
         except Exception as e:
             raise ImportError("open_clip support requires: pip install -e '.[openclip]'") from e
+
+        register_local_openclip_configs()
 
         model_name, pretrained, quick_gelu = _resolve_openclip_load_args(cfg)
         model, train_preprocess, preprocess = open_clip.create_model_and_transforms(
