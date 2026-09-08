@@ -645,6 +645,7 @@ def _compute_fmap_from_activations(
     activation_registry: dict[str, ActivationStore],
     *,
     n_anchors_per_layer: dict[str, int] | None = None,
+    n_anchors: int | None = None,
     num_eigs: int = 50,
     k_graph: int | None = None,
     device: str | torch.device = "cpu",
@@ -662,6 +663,10 @@ def _compute_fmap_from_activations(
     is computed, so a job that dies part-way keeps the layers it finished.
     ``precomputed`` holds maps recovered from a previous run; those layers are
     reused instead of recomputed.
+
+    ``n_anchors`` caps how many index-correspondent points are used as landmarks
+    for the descriptors. The cap drives cost: each anchor is one geodesic
+    single-source shortest path per side, and one descriptor column.
     """
     from .fmap_utils import FM_T
 
@@ -702,14 +707,23 @@ def _compute_fmap_from_activations(
                 print(f"{log_prefix} {key}: skipped (feature dim too small: {d_src}, {d_tgt})")
             continue
 
-        # Anchors: first n_anchors samples share index correspondence
-        n_anch = n_samples
+        # Anchors: the leading rows are the real samples, which share an index
+        # correspondence between source and target (interpolated points are
+        # appended after them).
+        n_real = n_samples
         if n_anchors_per_layer is not None and key in n_anchors_per_layer:
-            n_anch = n_anchors_per_layer[key]
-        n_anch = min(n_anch, n_samples)
-        anchors = torch.stack(
-            [torch.arange(n_anch), torch.arange(n_anch)], dim=1
-        )
+            n_real = n_anchors_per_layer[key]
+        n_real = min(n_real, n_samples)
+
+        if n_anchors is not None and 0 < int(n_anchors) < n_real:
+            # Spread the anchors over the real rows rather than taking a prefix:
+            # rows are tokens grouped by image, so a prefix would land inside the
+            # first couple of images only.
+            anchor_idx = torch.linspace(0, n_real - 1, int(n_anchors)).round().long().unique()
+        else:
+            anchor_idx = torch.arange(n_real)
+        n_anch = int(anchor_idx.numel())
+        anchors = torch.stack([anchor_idx, anchor_idx], dim=1)
 
         n_eig = min(num_eigs, n_samples - 1)
         k_eff = k_graph if k_graph is not None else max(int(n_samples * 0.07), 5)
@@ -1301,6 +1315,7 @@ class TheseusRebase:
         use_fmap: bool = False,
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
+        fmap_n_anchors: int | None = None,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -1457,6 +1472,7 @@ class TheseusRebase:
                         fmap_transforms = _compute_fmap_from_activations(
                             activation_registry,
                             n_anchors_per_layer=n_real_samples_per_layer,
+                            n_anchors=int(fmap_n_anchors) if fmap_n_anchors else None,
                             num_eigs=int(fmap_num_eigs),
                             k_graph=fmap_k_graph,
                             device=device,
@@ -1656,6 +1672,7 @@ class TheseusRebase:
         use_fmap: bool = False,
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
+        fmap_n_anchors: int | None = None,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -1701,6 +1718,7 @@ class TheseusRebase:
                 use_fmap=bool(use_fmap),
                 fmap_num_eigs=int(fmap_num_eigs),
                 fmap_k_graph=fmap_k_graph,
+                fmap_n_anchors=fmap_n_anchors,
                 activations_path=activations_path,
                 fmap_transforms_path=fmap_transforms_path,
                 verbose=bool(verbose),
