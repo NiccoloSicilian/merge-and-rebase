@@ -656,24 +656,44 @@ def _spectrum_report(evals, n_eig: int) -> str:
         dtype=np.float64,
     ).ravel()
     lam = np.sort(lam)
-    if lam.size < 3:
+    if lam.size < 8:
         return "spectrum: too few eigenvalues"
 
     # relative gap between consecutive eigenvalues: (l[i+1] - l[i]) / l[i]
     denom = np.maximum(np.abs(lam[:-1]), 1e-12)
     rel = (lam[1:] - lam[:-1]) / denom
-
     cut = min(max(n_eig - 1, 1), rel.size - 1)   # gap crossed by keeping n_eig
-    lo = max(1, n_eig // 2)
-    hi = min(rel.size, max(lo + 1, int(n_eig * 1.5)))
-    window = rel[lo:hi]
-    best = lo + int(np.argmax(window)) if window.size else cut
+
+    # Finding structure needs a different statistic. Spacings shrink like 1/k
+    # (Weyl), so the largest raw gap is almost always the smallest k in range
+    # and says nothing about where blocks end. Normalise each spacing by the
+    # median spacing around it: a genuine block boundary stands out as a
+    # multiple of the local scale at any depth, and the 1/k trend divides out.
+    # Skip the low indices, where lam ~ 0 makes relative gaps explode.
+    spacing = lam[1:] - lam[:-1]
+    lo = 4
+
+    def _local_ratio(i: int) -> float:
+        # Multiplicative window: spacings follow a power law in k, so a window
+        # proportional to k divides the trend out at every depth. A fixed-width
+        # window leaves a residual bias at small k, where the law is steepest.
+        a = max(0, int(i / 1.6))
+        b = min(spacing.size, int(i * 1.6) + 2)
+        med = float(np.median(spacing[a:b]))
+        return spacing[i] / med if med > 1e-15 else 0.0
+
+    best, best_ratio = cut, 0.0
+    for i in range(lo, spacing.size):
+        ratio = _local_ratio(i)
+        if ratio > best_ratio:
+            best, best_ratio = i, ratio
 
     near = "  ".join(f"{v:.4g}" for v in lam[max(0, n_eig - 3):n_eig + 3])
     return (
         f"spectrum: lam[{max(1, n_eig - 2)}..{min(lam.size, n_eig + 3)}]={near}  "
         f"rel_gap@{n_eig}={rel[cut]:.2e}  "
-        f"widest_gap_in[{lo + 1},{hi}]=k{best + 1}({rel[best]:.2e})"
+        f"cut_vs_local={_local_ratio(cut):.2f}x  "
+        f"widest_in[{lo + 1},{spacing.size}]=k{best + 1}({best_ratio:.2f}x local)"
     )
 
 
