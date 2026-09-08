@@ -747,6 +747,7 @@ def _compute_fmap_from_activations(
             # Skipping the layer leaves it to the Procrustes fallback.
             graphs = []
             disconnected = []
+            connectivity = []
             for side, rows_np in (("src", x_np), ("tgt", y_np)):
                 g = build_graph(
                     torch.tensor(rows_np, dtype=torch.float64),
@@ -757,9 +758,16 @@ def _compute_fmap_from_activations(
                     k=k_eff,
                     device=dev,
                 )
-                if not g.G.isconnected():
+                is_conn = bool(g.G.isconnected())
+                connectivity.append(f"{side}={is_conn}")
+                if not is_conn:
                     disconnected.append(side)
                 graphs.append(g)
+
+            # FM prints this itself when it builds its own graphs; passing them
+            # in skips that branch, so report it here instead.
+            if verbose:
+                print(f"{log_prefix} {key}: connected? {'  '.join(connectivity)}")
 
             if disconnected:
                 print(
