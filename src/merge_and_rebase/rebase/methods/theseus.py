@@ -646,6 +646,7 @@ def _compute_fmap_from_activations(
     *,
     n_anchors_per_layer: dict[str, int] | None = None,
     n_anchors: int | None = None,
+    center: bool = False,
     num_eigs: int = 50,
     k_graph: int | None = None,
     device: str | torch.device = "cpu",
@@ -667,6 +668,12 @@ def _compute_fmap_from_activations(
     ``n_anchors`` caps how many index-correspondent points are used as landmarks
     for the descriptors. The cap drives cost: each anchor is one geodesic
     single-source shortest path per side, and one descriptor column.
+
+    ``center`` subtracts the per-feature mean before the graphs are built. The
+    graphs use angular similarity, so a large shared offset -- which transformer
+    residual streams carry -- compresses every pairwise angle and flattens the
+    neighbourhood structure. Only the correspondence estimate is centred; the
+    Procrustes still fits the raw rows, so T keeps its meaning.
     """
     from .fmap_utils import FM_T
     from .fmap_utils.graph import build_graph
@@ -731,11 +738,20 @@ def _compute_fmap_from_activations(
         x_np = src_rows.numpy().astype(np.float64)
         y_np = tgt_rows.numpy().astype(np.float64)
 
+        # Geometry the correspondence is estimated from; the Procrustes below
+        # still fits the raw rows.
+        if center:
+            graph_src = (src_rows - src_rows.mean(dim=0, keepdim=True)).double()
+            graph_tgt = (tgt_rows - tgt_rows.mean(dim=0, keepdim=True)).double()
+        else:
+            graph_src = torch.tensor(x_np, dtype=torch.float64)
+            graph_tgt = torch.tensor(y_np, dtype=torch.float64)
+
         if verbose:
             print(
                 f"{log_prefix} {key}: computing FM_T  "
                 f"src={x_np.shape}  tgt={y_np.shape}  "
-                f"anchors={n_anch}  eigs={n_eig}  k={k_eff}"
+                f"anchors={n_anch}  eigs={n_eig}  k={k_eff}  centered={bool(center)}"
             )
 
         try:
@@ -745,24 +761,37 @@ def _compute_fmap_from_activations(
             # under the distance kernel; the eigendecomposition that FM_T runs
             # next then dies with a hard segfault, taking the whole job with it.
             # Skipping the layer leaves it to the Procrustes fallback.
+            # One kNN structure, two edge weightings, because the two consumers
+            # want opposite things:
+            #   - the Laplacian eigenbasis C is expressed in wants affinities
+            #     (large = close), i.e. the gaussian kernel;
+            #   - the dist_geod descriptors are shortest paths, so they want
+            #     lengths (large = far), i.e. the distance kernel.
+            # Weighting by distance throughout -- as this called for before --
+            # hands the eigendecomposition the inverse of an affinity, so every
+            # eigenvector, and C with them, comes out of a distorted basis.
             graphs = []
             disconnected = []
             connectivity = []
-            for side, rows_np in (("src", x_np), ("tgt", y_np)):
-                g = build_graph(
-                    torch.tensor(rows_np, dtype=torch.float64),
-                    algo="knn",
-                    kernel="distance",
-                    similarity="angular",
-                    m=3,
-                    k=k_eff,
-                    device=dev,
-                )
-                is_conn = bool(g.G.isconnected())
+            for side, rows_t in (("src", graph_src), ("tgt", graph_tgt)):
+                common = dict(algo="knn", similarity="angular", m=3, k=k_eff, device=dev)
+                g_sim = build_graph(rows_t, kernel="gaussian", **common)
+                g_dist = build_graph(rows_t, kernel="distance", **common)
+
+                # Connectivity of the affinity graph is the crash condition:
+                # eigendecomposing a disconnected one segfaults. Identical rows
+                # (MNIST's uniform background patches) weigh 1 here instead of
+                # the 0 a distance kernel gives them, so they no longer isolate.
+                is_conn = bool(g_sim.G.isconnected())
                 connectivity.append(f"{side}={is_conn}")
                 if not is_conn:
                     disconnected.append(side)
-                graphs.append(g)
+                # Reachability of the distance graph only degrades descriptor
+                # quality (unreachable anchors give exp(-inf)=0), so report it
+                # without discarding the layer.
+                if verbose and not g_dist.G.isconnected():
+                    print(f"{log_prefix} {key}: note — {side} geodesic graph is disconnected")
+                graphs.append((g_sim, g_dist))
 
             # FM prints this itself when it builds its own graphs; passing them
             # in skips that branch, so report it here instead.
@@ -778,8 +807,16 @@ def _compute_fmap_from_activations(
                 store.h_b_list.clear()
                 continue
 
-            for g in graphs:
-                g.eigvals, g.eigvecs = g.eigen_decomp(k=n_eig)
+            # Take the basis off the affinity graph, then point the object at
+            # the distance-weighted graph so the geodesics run on lengths. FM
+            # reads the basis from .eigvals/.eigvecs and the geodesics from .G,
+            # so one object can carry both.
+            prepared = []
+            for g_sim, g_dist in graphs:
+                g_sim.eigvals, g_sim.eigvecs = g_sim.eigen_decomp(k=n_eig)
+                g_sim.G = g_dist.G
+                prepared.append(g_sim)
+            graphs = prepared
 
             fmap = FM_T(
                 torch.tensor(x_np, dtype=torch.float64),
@@ -1517,6 +1554,7 @@ class TheseusRebase:
                             activation_registry,
                             n_anchors_per_layer=n_real_samples_per_layer,
                             n_anchors=int(fmap_n_anchors) if fmap_n_anchors else None,
+                            center=bool(center_acts),
                             num_eigs=int(fmap_num_eigs),
                             k_graph=fmap_k_graph,
                             device=device,
