@@ -641,6 +641,42 @@ def _augment_registry_with_interpolations(
     return registry
 
 
+def _spectrum_report(evals, n_eig: int) -> str:
+    """Describe the spectrum around a truncation at ``n_eig``.
+
+    Eigenvector conditioning is governed by the gap to the neighbouring
+    eigenvalue: inside a near-degenerate block only the subspace is determined,
+    the individual vectors are an arbitrary rotation of it, so a cut landing
+    inside such a block keeps a direction that carries no stable meaning. This
+    reports the relative gap at the cut and the widest gap nearby, which is
+    where a cut would land between blocks instead.
+    """
+    lam = np.asarray(
+        evals.detach().cpu().numpy() if isinstance(evals, torch.Tensor) else evals,
+        dtype=np.float64,
+    ).ravel()
+    lam = np.sort(lam)
+    if lam.size < 3:
+        return "spectrum: too few eigenvalues"
+
+    # relative gap between consecutive eigenvalues: (l[i+1] - l[i]) / l[i]
+    denom = np.maximum(np.abs(lam[:-1]), 1e-12)
+    rel = (lam[1:] - lam[:-1]) / denom
+
+    cut = min(max(n_eig - 1, 1), rel.size - 1)   # gap crossed by keeping n_eig
+    lo = max(1, n_eig // 2)
+    hi = min(rel.size, max(lo + 1, int(n_eig * 1.5)))
+    window = rel[lo:hi]
+    best = lo + int(np.argmax(window)) if window.size else cut
+
+    near = "  ".join(f"{v:.4g}" for v in lam[max(0, n_eig - 3):n_eig + 3])
+    return (
+        f"spectrum: lam[{max(1, n_eig - 2)}..{min(lam.size, n_eig + 3)}]={near}  "
+        f"rel_gap@{n_eig}={rel[cut]:.2e}  "
+        f"widest_gap_in[{lo + 1},{hi}]=k{best + 1}({rel[best]:.2e})"
+    )
+
+
 def _compute_fmap_from_activations(
     activation_registry: dict[str, ActivationStore],
     *,
@@ -792,7 +828,7 @@ def _compute_fmap_from_activations(
                     disconnected.append(f"{side}:affinity")
                 if not dist_conn:
                     disconnected.append(f"{side}:geodesic")
-                graphs.append((g_sim, g_dist))
+                graphs.append((side, g_sim, g_dist))
 
             # FM prints this itself when it builds its own graphs; passing them
             # in skips that branch, so report it here instead.
@@ -812,9 +848,17 @@ def _compute_fmap_from_activations(
             # the distance-weighted graph so the geodesics run on lengths. FM
             # reads the basis from .eigvals/.eigvecs and the geodesics from .G,
             # so one object can carry both.
+            # Decompose past the cut so the gap on the far side of it is
+            # visible, then slice back to n_eig for the map itself. On the GPU
+            # path the extra columns are free: eigh computes the whole spectrum
+            # and the code merely slices it.
+            n_log = min(int(n_eig * 1.5) + 2, n_samples - 1)
             prepared = []
-            for g_sim, g_dist in graphs:
-                g_sim.eigvals, g_sim.eigvecs = g_sim.eigen_decomp(k=n_eig)
+            for side, g_sim, g_dist in graphs:
+                evals, evecs = g_sim.eigen_decomp(k=n_log)
+                if verbose:
+                    print(f"{log_prefix} {key}: {side} {_spectrum_report(evals, n_eig)}")
+                g_sim.eigvals, g_sim.eigvecs = evals[:n_eig], evecs[:, :n_eig]
                 g_sim.G = g_dist.G
                 prepared.append(g_sim)
             graphs = prepared
