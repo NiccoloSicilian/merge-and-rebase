@@ -657,11 +657,15 @@ def _cached_layer_transform(obj, expected: dict) -> tuple[torch.Tensor | None, s
     stale T is a perfectly valid tensor. Comparing the settings recorded
     alongside it turns that into an explicit recompute.
     """
+    # An unverifiable cache is rejected rather than trusted. Accepting one
+    # defeats the check exactly when it matters: layers saved before the
+    # settings were recorded would be reused under any settings at all, so a
+    # run overriding a knob would silently keep the maps built without it.
     if not isinstance(obj, dict):
-        return obj, "legacy format, no settings recorded"
+        return None, "legacy format, settings unknown"
     saved = obj.get("settings")
     if not isinstance(saved, dict):
-        return obj.get("T"), "no settings recorded"
+        return None, "no settings recorded"
     for field, want in expected.items():
         got = saved.get(field)
         if got != want:
