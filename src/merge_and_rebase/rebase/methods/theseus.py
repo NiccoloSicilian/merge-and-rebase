@@ -831,6 +831,7 @@ def _compute_fmap_from_activations(
     center: bool = False,
     num_eigs: int = 50,
     eig_select: str = "fixed",
+    descr_weight_ref: int | None = 200,
     save_basis: bool = False,
     k_graph: int | None = None,
     device: str | torch.device = "cpu",
@@ -878,6 +879,7 @@ def _compute_fmap_from_activations(
                 "eig_select": str(eig_select),
                 "num_eigs": int(num_eigs),
                 "n_samples": int(store.n_samples),
+                "descr_weight_ref": None if not descr_weight_ref else int(descr_weight_ref),
             }
             cached_T, why = _cached_layer_transform(cached_layers[key], expected)
             if cached_T is not None:
@@ -1042,12 +1044,39 @@ def _compute_fmap_from_activations(
                 prepared.append(g_sim)
             graphs = prepared
 
+            # The energy is
+            #   w_descr*||C A - B||^2 + w_dcomm*sum_i||C D_Ai - D_Bi C||^2
+            #     + w_lap*||C L1 - L2 C||^2
+            # A and B carry one column per anchor and the commutativity sum runs
+            # over one operator per anchor, so both grow with the anchor count,
+            # while the Laplacian term is normalised and does not. Left alone,
+            # raising anchors quietly raises the descriptor weight and buries
+            # w_lap (already 1e-3) -- changing the regularisation balance rather
+            # than the information available. Scale the two anchor-dependent
+            # weights by ref/p so the balance is the same at every anchor count,
+            # with ref chosen so p = ref reproduces the defaults exactly.
+            reg_weights = None
+            if descr_weight_ref:
+                scale = float(descr_weight_ref) / float(max(n_anch, 1))
+                reg_weights = {
+                    "w_descr": 1e0 * scale,
+                    "w_dcomm": 1e-1 * scale,
+                    "w_lap": 1e-3,
+                    "w_orient": 0,
+                }
+                if verbose:
+                    print(
+                        f"{log_prefix} {key}: reg weights scaled x{scale:.3f} "
+                        f"for {n_anch} anchors (ref {descr_weight_ref})"
+                    )
+
             fmap = FM_T(
                 torch.tensor(x_np, dtype=torch.float64),
                 torch.tensor(y_np, dtype=torch.float64),
                 anchors,
                 transformation="orthogonal",
                 num_eigs=k_use,
+                reg_weights=reg_weights,
                 graph_algo="knn",
                 graph_similarity="angular",
                 graph_kernel="distance",
@@ -1092,6 +1121,7 @@ def _compute_fmap_from_activations(
                         "eig_select": str(eig_select),
                         "num_eigs": int(num_eigs),
                         "n_samples": int(n_samples),
+                        "descr_weight_ref": None if not descr_weight_ref else int(descr_weight_ref),
                     },
                     "n_eigs": int(k_use),
                     "n_anchors": int(n_anch),
@@ -1658,6 +1688,7 @@ class TheseusRebase:
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
         fmap_eig_select: str = "fixed",
+        fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
@@ -1826,6 +1857,7 @@ class TheseusRebase:
                             center=bool(center_acts),
                             num_eigs=int(fmap_num_eigs),
                             eig_select=str(fmap_eig_select),
+                            descr_weight_ref=fmap_descr_weight_ref,
                             save_basis=bool(fmap_save_basis),
                             k_graph=fmap_k_graph,
                             device=device,
@@ -2027,6 +2059,7 @@ class TheseusRebase:
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
         fmap_eig_select: str = "fixed",
+        fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
@@ -2075,6 +2108,7 @@ class TheseusRebase:
                 fmap_k_graph=fmap_k_graph,
                 fmap_n_anchors=fmap_n_anchors,
                 fmap_eig_select=str(fmap_eig_select),
+                fmap_descr_weight_ref=fmap_descr_weight_ref,
                 fmap_save_basis=bool(fmap_save_basis),
                 activations_path=activations_path,
                 fmap_transforms_path=fmap_transforms_path,
