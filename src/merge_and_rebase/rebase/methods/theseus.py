@@ -641,6 +641,99 @@ def _augment_registry_with_interpolations(
     return registry
 
 
+def _as_sorted_eigs(evals) -> np.ndarray:
+    lam = np.asarray(
+        evals.detach().cpu().numpy() if isinstance(evals, torch.Tensor) else evals,
+        dtype=np.float64,
+    ).ravel()
+    return np.sort(lam)
+
+
+def _local_gap_ratios(lam: np.ndarray, lo: int = 4) -> tuple[np.ndarray, np.ndarray]:
+    """Spacings and their size relative to the local spacing scale.
+
+    Returns ``(spacing, ratio)`` where ``spacing[i] = lam[i+1] - lam[i]`` and
+    ``ratio[i]`` divides it by the median spacing in a multiplicative window
+    around i. Spacings shrink like 1/k under Weyl, so a window proportional to
+    k divides that trend out and leaves only genuine structure: a block
+    boundary shows as a multiple of the local scale at any depth, while a
+    featureless power-law spectrum sits near 1.
+    """
+    spacing = lam[1:] - lam[:-1]
+    ratio = np.zeros_like(spacing)
+    for i in range(lo, spacing.size):
+        a = max(0, int(i / 1.6))
+        b = min(spacing.size, int(i * 1.6) + 2)
+        med = float(np.median(spacing[a:b]))
+        ratio[i] = spacing[i] / med if med > 1e-15 else 0.0
+    return spacing, ratio
+
+
+def _choose_eig_cut(
+    evals_src,
+    evals_tgt,
+    *,
+    ceiling: int,
+    k_min: int = 20,
+    max_real: int | None = None,
+    min_rel_gap: float = 1e-3,
+    min_score: float = 2.0,
+) -> tuple[int, str]:
+    """Pick where to truncate the eigenbasis, from the spectrum itself.
+
+    Scores each candidate by the *smaller* of the two sides' local gap ratios.
+    ``min`` rather than a mean because C assumes the first k functions on one
+    side correspond to the first k on the other: a cut that is clean on src and
+    inside a degenerate block on tgt is still broken, and in practice the two
+    sides disagree about where their structure lies.
+
+    Among near-equal candidates the largest k wins -- a bigger basis is more
+    expressive, and without that preference the choice drifts to small k where
+    gaps are naturally wider.
+    """
+    lam_s, lam_t = _as_sorted_eigs(evals_src), _as_sorted_eigs(evals_tgt)
+    hi = min(ceiling, lam_s.size - 1, lam_t.size - 1)
+    if max_real is not None:
+        # Past the real-sample count the basis describes interpolation paths
+        # between the measured points rather than the points themselves.
+        hi = min(hi, int(max_real) - 1)
+    if hi <= k_min:
+        return max(1, hi), f"range empty, using k={max(1, hi)}"
+
+    _, r_s = _local_gap_ratios(lam_s)
+    _, r_t = _local_gap_ratios(lam_t)
+    rel_s = (lam_s[1:] - lam_s[:-1]) / np.maximum(np.abs(lam_s[:-1]), 1e-12)
+    rel_t = (lam_t[1:] - lam_t[:-1]) / np.maximum(np.abs(lam_t[:-1]), 1e-12)
+
+    scored: dict[int, float] = {}
+    for k in range(k_min, hi + 1):
+        i = k - 1                                  # gap crossed by keeping k
+        if i >= r_s.size or i >= r_t.size:
+            break
+        # An absolute floor as well as a relative one: a cut between
+        # eigenvalues agreeing to four decimals is pathological however it
+        # scores against its neighbours.
+        if rel_s[i] < min_rel_gap or rel_t[i] < min_rel_gap:
+            continue
+        scored[k] = float(min(r_s[i], r_t[i]))
+
+    if scored:
+        best_score = max(scored.values())
+        # Largest k that is within 20% of the best: among equally clean cuts,
+        # the more expressive basis wins.
+        best_k = max(k for k, v in scored.items() if v >= 0.8 * best_score)
+    else:
+        best_k, best_score = -1, 0.0
+
+    if best_k < 0 or best_score < min_score:
+        fallback = min(ceiling, hi)
+        return fallback, (
+            f"no spectral structure (best {best_score:.2f}x < {min_score:.2f}x), "
+            f"falling back to k={fallback}"
+        )
+    return best_k, f"gap-selected k={best_k} ({best_score:.2f}x local, both sides)"
+
+
 def _spectrum_report(evals, n_eig: int) -> str:
     """Describe the spectrum around a truncation at ``n_eig``.
 
@@ -651,49 +744,24 @@ def _spectrum_report(evals, n_eig: int) -> str:
     reports the relative gap at the cut and the widest gap nearby, which is
     where a cut would land between blocks instead.
     """
-    lam = np.asarray(
-        evals.detach().cpu().numpy() if isinstance(evals, torch.Tensor) else evals,
-        dtype=np.float64,
-    ).ravel()
-    lam = np.sort(lam)
+    lam = _as_sorted_eigs(evals)
     if lam.size < 8:
         return "spectrum: too few eigenvalues"
 
-    # relative gap between consecutive eigenvalues: (l[i+1] - l[i]) / l[i]
     denom = np.maximum(np.abs(lam[:-1]), 1e-12)
     rel = (lam[1:] - lam[:-1]) / denom
     cut = min(max(n_eig - 1, 1), rel.size - 1)   # gap crossed by keeping n_eig
 
-    # Finding structure needs a different statistic. Spacings shrink like 1/k
-    # (Weyl), so the largest raw gap is almost always the smallest k in range
-    # and says nothing about where blocks end. Normalise each spacing by the
-    # median spacing around it: a genuine block boundary stands out as a
-    # multiple of the local scale at any depth, and the 1/k trend divides out.
-    # Skip the low indices, where lam ~ 0 makes relative gaps explode.
-    spacing = lam[1:] - lam[:-1]
     lo = 4
-
-    def _local_ratio(i: int) -> float:
-        # Multiplicative window: spacings follow a power law in k, so a window
-        # proportional to k divides the trend out at every depth. A fixed-width
-        # window leaves a residual bias at small k, where the law is steepest.
-        a = max(0, int(i / 1.6))
-        b = min(spacing.size, int(i * 1.6) + 2)
-        med = float(np.median(spacing[a:b]))
-        return spacing[i] / med if med > 1e-15 else 0.0
-
-    best, best_ratio = cut, 0.0
-    for i in range(lo, spacing.size):
-        ratio = _local_ratio(i)
-        if ratio > best_ratio:
-            best, best_ratio = i, ratio
+    spacing, ratio = _local_gap_ratios(lam, lo=lo)
+    best = int(np.argmax(ratio))
 
     near = "  ".join(f"{v:.4g}" for v in lam[max(0, n_eig - 3):n_eig + 3])
     return (
         f"spectrum: lam[{max(1, n_eig - 2)}..{min(lam.size, n_eig + 3)}]={near}  "
         f"rel_gap@{n_eig}={rel[cut]:.2e}  "
-        f"cut_vs_local={_local_ratio(cut):.2f}x  "
-        f"widest_in[{lo + 1},{spacing.size}]=k{best + 1}({best_ratio:.2f}x local)"
+        f"cut_vs_local={ratio[cut]:.2f}x  "
+        f"widest_in[{lo + 1},{spacing.size}]=k{best + 1}({ratio[best]:.2f}x local)"
     )
 
 
@@ -704,6 +772,7 @@ def _compute_fmap_from_activations(
     n_anchors: int | None = None,
     center: bool = False,
     num_eigs: int = 50,
+    eig_select: str = "fixed",
     k_graph: int | None = None,
     device: str | torch.device = "cpu",
     verbose: bool = True,
@@ -873,12 +942,29 @@ def _compute_fmap_from_activations(
             # path the extra columns are free: eigh computes the whole spectrum
             # and the code merely slices it.
             n_log = min(int(n_eig * 1.5) + 2, n_samples - 1)
-            prepared = []
+            decomposed = []
             for side, g_sim, g_dist in graphs:
                 evals, evecs = g_sim.eigen_decomp(k=n_log)
                 if verbose:
                     print(f"{log_prefix} {key}: {side} {_spectrum_report(evals, n_eig)}")
-                g_sim.eigvals, g_sim.eigvecs = evals[:n_eig], evecs[:, :n_eig]
+                decomposed.append((g_sim, g_dist, evals, evecs))
+
+            # With "gap", n_eig is a ceiling and the cut comes from the
+            # spectrum. Free to do here: the decomposition is already computed
+            # and the graphs and descriptors do not depend on k at all, so only
+            # the cheap tail of the pipeline sees the chosen value.
+            k_use = n_eig
+            if str(eig_select) == "gap":
+                k_use, why = _choose_eig_cut(
+                    decomposed[0][2], decomposed[1][2],
+                    ceiling=n_eig, max_real=n_real,
+                )
+                if verbose:
+                    print(f"{log_prefix} {key}: {why}")
+
+            prepared = []
+            for g_sim, g_dist, evals, evecs in decomposed:
+                g_sim.eigvals, g_sim.eigvecs = evals[:k_use], evecs[:, :k_use]
                 g_sim.G = g_dist.G
                 prepared.append(g_sim)
             graphs = prepared
@@ -888,7 +974,7 @@ def _compute_fmap_from_activations(
                 torch.tensor(y_np, dtype=torch.float64),
                 anchors,
                 transformation="orthogonal",
-                num_eigs=n_eig,
+                num_eigs=k_use,
                 graph_algo="knn",
                 graph_similarity="angular",
                 graph_kernel="distance",
@@ -1462,6 +1548,7 @@ class TheseusRebase:
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
+        fmap_eig_select: str = "fixed",
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -1621,6 +1708,7 @@ class TheseusRebase:
                             n_anchors=int(fmap_n_anchors) if fmap_n_anchors else None,
                             center=bool(center_acts),
                             num_eigs=int(fmap_num_eigs),
+                            eig_select=str(fmap_eig_select),
                             k_graph=fmap_k_graph,
                             device=device,
                             verbose=bool(verbose),
@@ -1820,6 +1908,7 @@ class TheseusRebase:
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
+        fmap_eig_select: str = "fixed",
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -1866,6 +1955,7 @@ class TheseusRebase:
                 fmap_num_eigs=int(fmap_num_eigs),
                 fmap_k_graph=fmap_k_graph,
                 fmap_n_anchors=fmap_n_anchors,
+                fmap_eig_select=str(fmap_eig_select),
                 activations_path=activations_path,
                 fmap_transforms_path=fmap_transforms_path,
                 verbose=bool(verbose),
