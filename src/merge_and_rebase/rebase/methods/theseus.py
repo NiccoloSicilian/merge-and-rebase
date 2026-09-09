@@ -641,6 +641,25 @@ def _augment_registry_with_interpolations(
     return registry
 
 
+def _to_cpu_tensor(x, dtype=torch.float32) -> torch.Tensor | None:
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().to(dtype)
+    return torch.as_tensor(np.asarray(x), dtype=dtype)
+
+
+def _fmap_payload_transform(obj) -> torch.Tensor:
+    """Pull the transform out of a saved layer, old format or new.
+
+    Layers used to be saved as the bare T tensor; they are now a dict holding
+    the pieces the map is built from. Both must load.
+    """
+    if isinstance(obj, dict):
+        return obj["T"]
+    return obj
+
+
 def _as_sorted_eigs(evals) -> np.ndarray:
     lam = np.asarray(
         evals.detach().cpu().numpy() if isinstance(evals, torch.Tensor) else evals,
@@ -773,6 +792,7 @@ def _compute_fmap_from_activations(
     center: bool = False,
     num_eigs: int = 50,
     eig_select: str = "fixed",
+    save_basis: bool = False,
     k_graph: int | None = None,
     device: str | torch.device = "cpu",
     verbose: bool = True,
@@ -993,11 +1013,39 @@ def _compute_fmap_from_activations(
             else:
                 fmap_transforms[key] = torch.tensor(np.array(T), dtype=torch.float32)
 
-            if save_dir:
-                torch.save(fmap_transforms[key], os.path.join(save_dir, f"{key}.pt"))
-
             sim = fmap.get_similarity()
             c_shape = np.array(fmap.C).shape
+
+            if save_dir:
+                # Everything the map is made of, so a later question about it
+                # does not mean rebuilding the graphs and geodesics: C, the
+                # point-to-point map read out of it, the spectra, and the
+                # settings that produced them. Phi in particular is what the
+                # anchor hit-rate check needs. The eigenvectors are the only
+                # bulky part -- (n x k) per side, tens of MB a layer -- so they
+                # are opt-in; the rest is a few hundred KB.
+                payload = {
+                    "T": fmap_transforms[key],
+                    "C": _to_cpu_tensor(fmap.C, torch.float32),
+                    "Phi_flat": _to_cpu_tensor(getattr(fmap, "Phi_flat", None), torch.int64),
+                    "eigvals_src": _to_cpu_tensor(graphs[0].eigvals, torch.float32),
+                    "eigvals_tgt": _to_cpu_tensor(graphs[1].eigvals, torch.float32),
+                    "anchors": anchor_idx.cpu().clone(),
+                    "similarity": float(sim),
+                    "n_eigs": int(k_use),
+                    "n_anchors": int(n_anch),
+                    "k_graph": int(k_eff),
+                    "n_real": int(n_real),
+                    "n_samples": int(n_samples),
+                    "centered": bool(center),
+                    "src_shape": tuple(x_np.shape),
+                    "tgt_shape": tuple(y_np.shape),
+                }
+                if save_basis:
+                    payload["eigvecs_src"] = _to_cpu_tensor(graphs[0].eigvecs, torch.float32)
+                    payload["eigvecs_tgt"] = _to_cpu_tensor(graphs[1].eigvecs, torch.float32)
+                torch.save(payload, os.path.join(save_dir, f"{key}.pt"))
+
             print(
                 f"{log_prefix} {key}: fmap computed  "
                 f"C={c_shape}  T={tuple(fmap_transforms[key].shape)}  "
@@ -1549,6 +1597,7 @@ class TheseusRebase:
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
         fmap_eig_select: str = "fixed",
+        fmap_save_basis: bool = False,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -1681,7 +1730,12 @@ class TheseusRebase:
                 if use_fmap:
                     _fmap_path = fmap_transforms_path if fmap_transforms_path else None
                     if _fmap_path and os.path.isfile(_fmap_path):
-                        fmap_transforms = torch.load(_fmap_path, map_location="cpu", weights_only=False)
+                        fmap_transforms = {
+                            k: _fmap_payload_transform(v)
+                            for k, v in torch.load(
+                                _fmap_path, map_location="cpu", weights_only=False
+                            ).items()
+                        }
                         if verbose:
                             print(f"{log_prefix} prepare: loaded precomputed fmap transforms ({len(fmap_transforms)} layers) from {_fmap_path}")
                     else:
@@ -1693,9 +1747,11 @@ class TheseusRebase:
                             for fname in os.listdir(_fmap_path):
                                 if fname.endswith(".pt"):
                                     layer_key = fname[:-3]  # strip .pt
-                                    cached[layer_key] = torch.load(
-                                        os.path.join(_fmap_path, fname),
-                                        map_location="cpu", weights_only=False,
+                                    cached[layer_key] = _fmap_payload_transform(
+                                        torch.load(
+                                            os.path.join(_fmap_path, fname),
+                                            map_location="cpu", weights_only=False,
+                                        )
                                     )
                             if verbose:
                                 print(f"{log_prefix} prepare: loaded {len(cached)} cached fmap transforms from {_fmap_path}")
@@ -1709,6 +1765,7 @@ class TheseusRebase:
                             center=bool(center_acts),
                             num_eigs=int(fmap_num_eigs),
                             eig_select=str(fmap_eig_select),
+                            save_basis=bool(fmap_save_basis),
                             k_graph=fmap_k_graph,
                             device=device,
                             verbose=bool(verbose),
@@ -1909,6 +1966,7 @@ class TheseusRebase:
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
         fmap_eig_select: str = "fixed",
+        fmap_save_basis: bool = False,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -1956,6 +2014,7 @@ class TheseusRebase:
                 fmap_k_graph=fmap_k_graph,
                 fmap_n_anchors=fmap_n_anchors,
                 fmap_eig_select=str(fmap_eig_select),
+                fmap_save_basis=bool(fmap_save_basis),
                 activations_path=activations_path,
                 fmap_transforms_path=fmap_transforms_path,
                 verbose=bool(verbose),
