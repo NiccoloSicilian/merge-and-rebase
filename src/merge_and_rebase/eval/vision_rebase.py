@@ -275,7 +275,19 @@ def main() -> None:
             "activation_source_ckpt": args.activation_source_ckpt,
             "activation_target_ckpt": args.activation_target_ckpt,
         }
-        cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
+        # method_params / block_extension_params merge key-by-key instead of
+        # replacing. A shallow overwrite means --method-params '{"x": 1}' drops
+        # every other param the config set, so overriding one value forces you
+        # to restate the whole block -- or write a new config per value.
+        _nested = ("method_params", "block_extension_params")
+        cfg = merge_non_none(
+            cfg, {k: v for k, v in cli.items() if v is not None and k not in _nested}
+        )
+        for _key in _nested:
+            _override = cli.get(_key)
+            if _override is not None:
+                _base = cfg.get(_key) or {}
+                cfg[_key] = {**_base, **_override}
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
         cfg["logging"] = logging_cfg
 

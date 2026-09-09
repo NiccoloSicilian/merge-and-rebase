@@ -649,6 +649,26 @@ def _to_cpu_tensor(x, dtype=torch.float32) -> torch.Tensor | None:
     return torch.as_tensor(np.asarray(x), dtype=dtype)
 
 
+def _cached_layer_transform(obj, expected: dict) -> tuple[torch.Tensor | None, str]:
+    """Return a cached layer's T, or None with the reason it was rejected.
+
+    The cache is addressed by directory, so nothing stops a run with different
+    settings from loading maps built under the old ones -- silently, since a
+    stale T is a perfectly valid tensor. Comparing the settings recorded
+    alongside it turns that into an explicit recompute.
+    """
+    if not isinstance(obj, dict):
+        return obj, "legacy format, no settings recorded"
+    saved = obj.get("settings")
+    if not isinstance(saved, dict):
+        return obj.get("T"), "no settings recorded"
+    for field, want in expected.items():
+        got = saved.get(field)
+        if got != want:
+            return None, f"{field} {got!r} != {want!r}"
+    return obj.get("T"), "settings match"
+
+
 def _fmap_payload_transform(obj) -> torch.Tensor:
     """Pull the transform out of a saved layer, old format or new.
 
@@ -840,17 +860,31 @@ def _compute_fmap_from_activations(
 
     dev = torch.device(device) if isinstance(device, str) else device
     log_prefix = "[theseus-fmap]"
-    fmap_transforms: dict[str, torch.Tensor] = dict(precomputed or {})
+    fmap_transforms: dict[str, torch.Tensor] = {}
+    cached_layers = dict(precomputed or {})
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
     for key, store in activation_registry.items():
-        if key in fmap_transforms:
+        if key in cached_layers:
+            expected = {
+                "n_anchors": None if n_anchors is None else int(n_anchors),
+                "k_graph": None if k_graph is None else int(k_graph),
+                "center": bool(center),
+                "eig_select": str(eig_select),
+                "num_eigs": int(num_eigs),
+                "n_samples": int(store.n_samples),
+            }
+            cached_T, why = _cached_layer_transform(cached_layers[key], expected)
+            if cached_T is not None:
+                fmap_transforms[key] = cached_T
+                if verbose:
+                    print(f"{log_prefix} {key}: reusing cached map T={tuple(cached_T.shape)} ({why})")
+                store.h_a_list.clear()
+                store.h_b_list.clear()
+                continue
             if verbose:
-                print(f"{log_prefix} {key}: reusing cached map T={tuple(fmap_transforms[key].shape)}")
-            store.h_a_list.clear()
-            store.h_b_list.clear()
-            continue
+                print(f"{log_prefix} {key}: cached map rejected ({why}) — recomputing")
 
         src_rows, tgt_rows = store.rows(center=False)
         if src_rows is None or tgt_rows is None:
@@ -1047,6 +1081,14 @@ def _compute_fmap_from_activations(
                     "eigvals_tgt": _to_cpu_tensor(graphs[1].eigvals, torch.float32),
                     "anchors": anchor_idx.cpu().clone(),
                     "similarity": float(sim),
+                    "settings": {
+                        "n_anchors": None if n_anchors is None else int(n_anchors),
+                        "k_graph": None if k_graph is None else int(k_graph),
+                        "center": bool(center),
+                        "eig_select": str(eig_select),
+                        "num_eigs": int(num_eigs),
+                        "n_samples": int(n_samples),
+                    },
                     "n_eigs": int(k_use),
                     "n_anchors": int(n_anch),
                     "k_graph": int(k_eff),
@@ -1762,11 +1804,11 @@ class TheseusRebase:
                             for fname in os.listdir(_fmap_path):
                                 if fname.endswith(".pt"):
                                     layer_key = fname[:-3]  # strip .pt
-                                    cached[layer_key] = _fmap_payload_transform(
-                                        torch.load(
-                                            os.path.join(_fmap_path, fname),
-                                            map_location="cpu", weights_only=False,
-                                        )
+                                    # raw payload: the settings recorded in it
+                                    # are checked before the map is reused
+                                    cached[layer_key] = torch.load(
+                                        os.path.join(_fmap_path, fname),
+                                        map_location="cpu", weights_only=False,
                                     )
                             if verbose:
                                 print(f"{log_prefix} prepare: loaded {len(cached)} cached fmap transforms from {_fmap_path}")
