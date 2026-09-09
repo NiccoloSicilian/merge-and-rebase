@@ -641,6 +641,45 @@ def _augment_registry_with_interpolations(
     return registry
 
 
+def _fps_anchor_indices(src: torch.Tensor, tgt: torch.Tensor, n_anchors: int) -> torch.Tensor:
+    """Farthest-point sampling over the real rows, jointly on both sides.
+
+    Each anchor contributes one probe function -- the geodesic field centred on
+    it -- and the map is fit so those fields transport correctly. Two probes
+    sitting next to each other are worth barely more than one, so what matters
+    is that the set spans the cloud, not that any single point is unusual.
+
+    Greedily add the row farthest from everything already chosen, scoring by the
+    *smaller* of the two sides' distances: a row distinctive in the source but
+    duplicated in the target is still an ambiguous anchor. MNIST's uniform
+    background patches are duplicated on both sides, so that whole population
+    collapses to a single pick instead of consuming most of the budget.
+
+    Angular distance, matching the graph's similarity.
+    """
+    xs = torch.nn.functional.normalize(src.double(), dim=1)
+    xt = torch.nn.functional.normalize(tgt.double(), dim=1)
+    n = int(xs.shape[0])
+    n_anchors = min(int(n_anchors), n)
+
+    # Seed from the medoid, not an extreme point: FPS already leans toward
+    # outliers and starting on one compounds it.
+    first = int((xs @ xs.mean(dim=0, keepdim=True).T).squeeze(1).argmax())
+
+    selected = [first]
+    d_s = 1.0 - xs @ xs[first]
+    d_t = 1.0 - xt @ xt[first]
+    for _ in range(n_anchors - 1):
+        score = torch.minimum(d_s, d_t)
+        score[torch.tensor(selected, dtype=torch.long)] = -float("inf")
+        j = int(torch.argmax(score))
+        selected.append(j)
+        d_s = torch.minimum(d_s, 1.0 - xs @ xs[j])
+        d_t = torch.minimum(d_t, 1.0 - xt @ xt[j])
+
+    return torch.tensor(sorted(selected), dtype=torch.long)
+
+
 def _to_cpu_tensor(x, dtype=torch.float32) -> torch.Tensor | None:
     if x is None:
         return None
@@ -828,6 +867,8 @@ def _compute_fmap_from_activations(
     *,
     n_anchors_per_layer: dict[str, int] | None = None,
     n_anchors: int | None = None,
+    anchor_select: str = "linspace",
+    seed: int = 0,
     center: bool = False,
     num_eigs: int = 50,
     eig_select: str = "fixed",
@@ -874,6 +915,7 @@ def _compute_fmap_from_activations(
         if key in cached_layers:
             expected = {
                 "n_anchors": None if n_anchors is None else int(n_anchors),
+                "anchor_select": str(anchor_select),
                 "k_graph": None if k_graph is None else int(k_graph),
                 "center": bool(center),
                 "eig_select": str(eig_select),
@@ -923,16 +965,6 @@ def _compute_fmap_from_activations(
             n_real = n_anchors_per_layer[key]
         n_real = min(n_real, n_samples)
 
-        if n_anchors is not None and 0 < int(n_anchors) < n_real:
-            # Spread the anchors over the real rows rather than taking a prefix:
-            # rows are tokens grouped by image, so a prefix would land inside the
-            # first couple of images only.
-            anchor_idx = torch.linspace(0, n_real - 1, int(n_anchors)).round().long().unique()
-        else:
-            anchor_idx = torch.arange(n_real)
-        n_anch = int(anchor_idx.numel())
-        anchors = torch.stack([anchor_idx, anchor_idx], dim=1)
-
         n_eig = min(num_eigs, n_samples - 1)
         k_eff = k_graph if k_graph is not None else max(int(n_samples * 0.07), 5)
         x_np = src_rows.numpy().astype(np.float64)
@@ -947,11 +979,32 @@ def _compute_fmap_from_activations(
             graph_src = torch.tensor(x_np, dtype=torch.float64)
             graph_tgt = torch.tensor(y_np, dtype=torch.float64)
 
+        # Anchors are drawn only from the real rows: the interpolated points
+        # carry no index correspondence between the two sides.
+        if n_anchors is not None and 0 < int(n_anchors) < n_real:
+            mode = str(anchor_select)
+            if mode == "fps":
+                anchor_idx = _fps_anchor_indices(
+                    graph_src[:n_real], graph_tgt[:n_real], int(n_anchors)
+                )
+            elif mode == "random":
+                gen = torch.Generator().manual_seed(int(seed))
+                anchor_idx = torch.randperm(n_real, generator=gen)[: int(n_anchors)].sort().values
+            else:
+                # linspace: a lattice over the row index. Rows are image-major,
+                # so it aliases against the token count -- which is why it is no
+                # longer the only option.
+                anchor_idx = torch.linspace(0, n_real - 1, int(n_anchors)).round().long().unique()
+        else:
+            anchor_idx = torch.arange(n_real)
+        n_anch = int(anchor_idx.numel())
+        anchors = torch.stack([anchor_idx, anchor_idx], dim=1)
+
         if verbose:
             print(
                 f"{log_prefix} {key}: computing FM_T  "
                 f"src={x_np.shape}  tgt={y_np.shape}  "
-                f"anchors={n_anch}  eigs={n_eig}  k={k_eff}  centered={bool(center)}"
+                f"anchors={n_anch}({anchor_select})  eigs={n_eig}  k={k_eff}  centered={bool(center)}"
             )
 
         try:
@@ -1116,6 +1169,7 @@ def _compute_fmap_from_activations(
                     "similarity": float(sim),
                     "settings": {
                         "n_anchors": None if n_anchors is None else int(n_anchors),
+                        "anchor_select": str(anchor_select),
                         "k_graph": None if k_graph is None else int(k_graph),
                         "center": bool(center),
                         "eig_select": str(eig_select),
@@ -1687,6 +1741,7 @@ class TheseusRebase:
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
+        fmap_anchor_select: str = "linspace",
         fmap_eig_select: str = "fixed",
         fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
@@ -1854,6 +1909,8 @@ class TheseusRebase:
                             activation_registry,
                             n_anchors_per_layer=n_real_samples_per_layer,
                             n_anchors=int(fmap_n_anchors) if fmap_n_anchors else None,
+                            anchor_select=str(fmap_anchor_select or "linspace"),
+                            seed=int(seed),
                             center=bool(center_acts),
                             num_eigs=int(fmap_num_eigs),
                             eig_select=str(fmap_eig_select),
@@ -2058,6 +2115,7 @@ class TheseusRebase:
         fmap_num_eigs: int = 50,
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
+        fmap_anchor_select: str = "linspace",
         fmap_eig_select: str = "fixed",
         fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
@@ -2107,6 +2165,7 @@ class TheseusRebase:
                 fmap_num_eigs=int(fmap_num_eigs),
                 fmap_k_graph=fmap_k_graph,
                 fmap_n_anchors=fmap_n_anchors,
+                fmap_anchor_select=str(fmap_anchor_select or "linspace"),
                 fmap_eig_select=str(fmap_eig_select),
                 fmap_descr_weight_ref=fmap_descr_weight_ref,
                 fmap_save_basis=bool(fmap_save_basis),
