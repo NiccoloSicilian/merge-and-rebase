@@ -745,10 +745,25 @@ def _choose_eig_cut(
         best_k, best_score = -1, 0.0
 
     if best_k < 0 or best_score < min_score:
+        # The floor applies here too. Rejecting a cutoff as degenerate and then
+        # handing it back as the fallback is self-contradictory, and it lands on
+        # exactly the cuts this rule exists to avoid: at the ceiling several
+        # layer-sides sit at rel_gap ~ 1e-4. Walk down until both sides clear it.
         fallback = min(ceiling, hi)
+        moved = 0
+        while fallback > k_min:
+            i = fallback - 1
+            if i >= rel_s.size or i >= rel_t.size:
+                fallback -= 1
+                continue
+            if rel_s[i] >= min_rel_gap and rel_t[i] >= min_rel_gap:
+                break
+            fallback -= 1
+            moved += 1
+        note = f" (walked down {moved} from the ceiling to clear {min_rel_gap:g})" if moved else ""
         return fallback, (
             f"no spectral structure (best {best_score:.2f}x < {min_score:.2f}x), "
-            f"falling back to k={fallback}"
+            f"falling back to k={fallback}{note}"
         )
     return best_k, f"gap-selected k={best_k} ({best_score:.2f}x local, both sides)"
 
