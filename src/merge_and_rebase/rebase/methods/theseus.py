@@ -428,6 +428,7 @@ def collect_activations(
     store_raw: bool = False,
     store_a_gram: bool = False,
     store_b_gram: bool = False,
+    balanced_batches: bool = False,
 ) -> dict[str, ActivationStore]:
     registry: dict[str, ActivationStore] = {}
     source_hook = _ActivationHook(source_model)
@@ -441,6 +442,7 @@ def collect_activations(
             n_batches=n_batches,
             seed=seed,
             batch_size=batch_size,
+            balanced=balanced_batches,
         )
         if iterator is None:
             iterator = zip(source_dataloader, target_dataloader, strict=True)
@@ -1345,15 +1347,36 @@ def _stratified_perm(
     targets = getattr(dataset, "targets", None)
     if targets is None:
         targets = getattr(dataset, "label", None)
-    if targets is None:
-        return None
 
-    if hasattr(targets, "tolist"):
-        labels = targets.tolist()[:n_samples]
-    elif isinstance(targets, list):
-        labels = targets[:n_samples]
+    if targets is not None:
+        if hasattr(targets, "tolist"):
+            labels = targets.tolist()[:n_samples]
+        elif isinstance(targets, list):
+            labels = targets[:n_samples]
+        else:
+            labels = [int(targets[i]) for i in range(n_samples)]
     else:
-        labels = [int(targets[i]) for i in range(n_samples)]
+        # The vision suites wrap an HF split and expose neither .targets nor
+        # .label, so this returned None and the caller fell back to an
+        # unbalanced draw -- silently, on every run.
+        #
+        # Only the O(1) accessors are tried. eval.utils has a per-item fallback
+        # that reads every example, which would decode 60k images here just to
+        # read their labels, and it drags in the whole eval import chain.
+        labels = None
+        for holder in (getattr(dataset, "labels", None),):
+            if holder is not None:
+                labels = [int(v) for v in list(holder)[:n_samples]]
+        if labels is None:
+            split = getattr(dataset, "split", None)
+            label_key = getattr(dataset, "label_key", None)
+            if split is not None and label_key is not None:
+                try:
+                    labels = [int(v) for v in list(split[label_key])[:n_samples]]
+                except Exception:
+                    labels = None
+        if labels is None:
+            return None
 
     # Group indices by class
     class_indices: dict[int, list[int]] = defaultdict(list)
@@ -1366,12 +1389,16 @@ def _stratified_perm(
 
     total = n_samples if n_batches is None else min(n_samples, n_batches * batch_size)
     per_class = max(1, total // n_classes)
+    # Spread the remainder instead of dropping it: at 32 images over 10 classes
+    # a bare floor would collect 30 and quietly shrink the calibration set.
+    remainder = max(0, total - per_class * n_classes)
 
     selected: list[int] = []
-    for cls in sorted(class_indices.keys()):
+    for rank, cls in enumerate(sorted(class_indices.keys())):
+        take = per_class + (1 if rank < remainder else 0)
         pool = torch.tensor(class_indices[cls])
         pool = pool[torch.randperm(len(pool), generator=generator)]
-        selected.extend(pool[:per_class].tolist())
+        selected.extend(pool[:take].tolist())
 
     perm = torch.tensor(selected)
     perm = perm[torch.randperm(len(perm), generator=generator)]
@@ -1387,6 +1414,7 @@ def _iter_random_dataset_batches(
     n_batches: int | None,
     seed: int,
     batch_size: int | None,
+    balanced: bool = False,
 ) -> Iterable[tuple[Any, Any]] | None:
     source_dataset = getattr(source_dataloader, "dataset", None)
     target_dataset = getattr(target_dataloader, "dataset", None)
@@ -1424,7 +1452,11 @@ def _iter_random_dataset_batches(
     generator.manual_seed(int(seed))
 
     # Try stratified sampling: equal samples per class
-    perm = _stratified_perm(source_dataset, n_samples, n_batches, batch_size, generator)
+    perm = (
+        _stratified_perm(source_dataset, n_samples, n_batches, batch_size, generator)
+        if balanced
+        else None
+    )
     if perm is None:
         # Fallback to random
         perm = torch.randperm(n_samples, generator=generator)
@@ -1742,6 +1774,7 @@ class TheseusRebase:
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
         fmap_anchor_select: str = "linspace",
+        balanced_batches: bool = False,
         fmap_eig_select: str = "fixed",
         fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
@@ -1846,6 +1879,7 @@ class TheseusRebase:
                         n_batches=n_batches,
                         seed=int(seed),
                         batch_size=batch_size,
+                        balanced_batches=bool(balanced_batches),
                         store_raw=n_interpolations > 0 or use_fmap,
                         store_a_gram=whiten_power > 0.0,
                         store_b_gram=whiten_power > 0.0,
@@ -2116,6 +2150,7 @@ class TheseusRebase:
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
         fmap_anchor_select: str = "linspace",
+        balanced_batches: bool = False,
         fmap_eig_select: str = "fixed",
         fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
@@ -2166,6 +2201,7 @@ class TheseusRebase:
                 fmap_k_graph=fmap_k_graph,
                 fmap_n_anchors=fmap_n_anchors,
                 fmap_anchor_select=str(fmap_anchor_select or "linspace"),
+                balanced_batches=bool(balanced_batches),
                 fmap_eig_select=str(fmap_eig_select),
                 fmap_descr_weight_ref=fmap_descr_weight_ref,
                 fmap_save_basis=bool(fmap_save_basis),
