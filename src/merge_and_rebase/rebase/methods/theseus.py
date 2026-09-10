@@ -916,6 +916,7 @@ def _compute_fmap_from_activations(
     for key, store in activation_registry.items():
         if key in cached_layers:
             expected = {
+                "seed": int(seed),
                 "n_anchors": None if n_anchors is None else int(n_anchors),
                 "anchor_select": str(anchor_select),
                 "k_graph": None if k_graph is None else int(k_graph),
@@ -1170,6 +1171,7 @@ def _compute_fmap_from_activations(
                     "anchors": anchor_idx.cpu().clone(),
                     "similarity": float(sim),
                     "settings": {
+                        "seed": int(seed),
                         "n_anchors": None if n_anchors is None else int(n_anchors),
                         "anchor_select": str(anchor_select),
                         "k_graph": None if k_graph is None else int(k_graph),
