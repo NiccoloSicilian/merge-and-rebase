@@ -643,6 +643,31 @@ def _augment_registry_with_interpolations(
     return registry
 
 
+def _make_fmt_reusing_descriptors(FM_T):
+    """FM_T that can be handed descriptors instead of recomputing them.
+
+    The geodesic descriptor fields depend on the graphs and the anchors, not on
+    the truncation, but FM computes them inside its constructor -- so sweeping k
+    would redo the single most expensive step for every value. Caching them
+    makes the sweep nearly free.
+    """
+
+    class _FMTReusingDescriptors(FM_T):
+        def __init__(self, *args, _descriptors_cache=None, **kwargs):
+            # set before super().__init__, which calls compute_descriptors
+            self._descriptors_cache = _descriptors_cache
+            super().__init__(*args, **kwargs)
+
+        def compute_descriptors(self, n_descr=10):
+            cache = getattr(self, "_descriptors_cache", None)
+            if cache is not None:
+                self.X_desc, self.Y_desc = cache
+                return
+            super().compute_descriptors(n_descr)
+
+    return _FMTReusingDescriptors
+
+
 def _fps_anchor_indices(src: torch.Tensor, tgt: torch.Tensor, n_anchors: int) -> torch.Tensor:
     """Farthest-point sampling over the real rows, jointly on both sides.
 
@@ -872,7 +897,7 @@ def _compute_fmap_from_activations(
     anchor_select: str = "linspace",
     seed: int = 0,
     center: bool = False,
-    num_eigs: int = 50,
+    num_eigs: int | list[int] = 50,
     eig_select: str = "fixed",
     descr_weight_ref: int | None = 200,
     save_basis: bool = False,
@@ -905,6 +930,8 @@ def _compute_fmap_from_activations(
     """
     from .fmap_utils import FM_T
     from .fmap_utils.graph import build_graph
+
+    _FMTReusingDescriptors = _make_fmt_reusing_descriptors(FM_T)
 
     dev = torch.device(device) if isinstance(device, str) else device
     log_prefix = "[theseus-fmap]"
@@ -968,7 +995,15 @@ def _compute_fmap_from_activations(
             n_real = n_anchors_per_layer[key]
         n_real = min(n_real, n_samples)
 
-        n_eig = min(num_eigs, n_samples - 1)
+        # A list means: build the layer once and emit a map for every k. The
+        # graphs, the geodesic descriptors and the eigendecomposition do not
+        # depend on k at all -- only rfm, zoomout, the p2p readout and the final
+        # Procrustes do -- so a sweep costs barely more than a single value.
+        if isinstance(num_eigs, (list, tuple)):
+            k_list = sorted({min(int(k), n_samples - 1) for k in num_eigs})
+        else:
+            k_list = [min(int(num_eigs), n_samples - 1)]
+        n_eig = max(k_list)
         k_eff = k_graph if k_graph is not None else max(int(n_samples * 0.07), 5)
         x_np = src_rows.numpy().astype(np.float64)
         y_np = tgt_rows.numpy().astype(np.float64)
@@ -1093,9 +1128,10 @@ def _compute_fmap_from_activations(
                 if verbose:
                     print(f"{log_prefix} {key}: {why}")
 
+            k_targets = k_list if len(k_list) > 1 else [k_use]
+
             prepared = []
             for g_sim, g_dist, evals, evecs in decomposed:
-                g_sim.eigvals, g_sim.eigvecs = evals[:k_use], evecs[:, :k_use]
                 g_sim.G = g_dist.G
                 prepared.append(g_sim)
             graphs = prepared
@@ -1126,81 +1162,106 @@ def _compute_fmap_from_activations(
                         f"for {n_anch} anchors (ref {descr_weight_ref})"
                     )
 
-            fmap = FM_T(
-                torch.tensor(x_np, dtype=torch.float64),
-                torch.tensor(y_np, dtype=torch.float64),
-                anchors,
-                transformation="orthogonal",
-                num_eigs=k_use,
-                reg_weights=reg_weights,
-                graph_algo="knn",
-                graph_similarity="angular",
-                graph_kernel="distance",
-                descriptors=("dist_geod",),
-                k=k_eff,
-                n_descr=1,
-                compute_gt_map=False,
-                refine=True,
-                device=dev,
-                graphs=tuple(graphs),
-            )
-            # fmap.T: (d_src, d_tgt) — same convention as Procrustes maps
-            T = fmap.T
-            if isinstance(T, torch.Tensor):
-                fmap_transforms[key] = T.float().cpu()
-            else:
-                fmap_transforms[key] = torch.tensor(np.array(T), dtype=torch.float32)
+            descr_cache: list | None = None
+            for k_target in k_targets:
+                for g_sim, (_, _, evals, evecs) in zip(graphs, decomposed):
+                    g_sim.eigvals = evals[:k_target]
+                    g_sim.eigvecs = evecs[:, :k_target]
 
-            sim = fmap.get_similarity()
-            c_shape = np.array(fmap.C).shape
+                fmap = _FMTReusingDescriptors(
+                    torch.tensor(x_np, dtype=torch.float64),
+                    torch.tensor(y_np, dtype=torch.float64),
+                    anchors,
+                    transformation="orthogonal",
+                    num_eigs=k_target,
+                    reg_weights=reg_weights,
+                    graph_algo="knn",
+                    graph_similarity="angular",
+                    graph_kernel="distance",
+                    descriptors=("dist_geod",),
+                    k=k_eff,
+                    n_descr=1,
+                    compute_gt_map=False,
+                    refine=True,
+                    device=dev,
+                    graphs=tuple(graphs),
+                    _descriptors_cache=descr_cache,
+                )
+                # The descriptors are geodesic fields from the anchors: they
+                # depend on the graphs, not on k, so the first value pays for
+                # them and the rest reuse them.
+                if descr_cache is None:
+                    descr_cache = [fmap.X_desc, fmap.Y_desc]
 
-            if save_dir:
-                # Everything the map is made of, so a later question about it
-                # does not mean rebuilding the graphs and geodesics: C, the
-                # point-to-point map read out of it, the spectra, and the
-                # settings that produced them. Phi in particular is what the
-                # anchor hit-rate check needs. The eigenvectors are the only
-                # bulky part -- (n x k) per side, tens of MB a layer -- so they
-                # are opt-in; the rest is a few hundred KB.
-                payload = {
-                    "T": fmap_transforms[key],
-                    "C": _to_cpu_tensor(fmap.C, torch.float32),
-                    "Phi_flat": _to_cpu_tensor(getattr(fmap, "Phi_flat", None), torch.int64),
-                    "eigvals_src": _to_cpu_tensor(graphs[0].eigvals, torch.float32),
-                    "eigvals_tgt": _to_cpu_tensor(graphs[1].eigvals, torch.float32),
-                    "anchors": anchor_idx.cpu().clone(),
-                    "similarity": float(sim),
-                    "settings": {
-                        "seed": int(seed),
-                        "n_anchors": None if n_anchors is None else int(n_anchors),
-                        "anchor_select": str(anchor_select),
-                        "k_graph": None if k_graph is None else int(k_graph),
-                        "center": bool(center),
-                        "eig_select": str(eig_select),
-                        "num_eigs": int(num_eigs),
+                # fmap.T: (d_src, d_tgt) — same convention as Procrustes maps
+                T = fmap.T
+                T = T.float().cpu() if isinstance(T, torch.Tensor) else torch.tensor(
+                    np.array(T), dtype=torch.float32
+                )
+                sim = fmap.get_similarity()
+                c_shape = np.array(fmap.C).shape
+
+                # The run itself transports with the first k; the others exist
+                # to be loaded by cheap eval jobs.
+                if key not in fmap_transforms:
+                    fmap_transforms[key] = T
+                    k_use = k_target
+
+                if save_dir:
+                    # Everything the map is made of, so a later question about
+                    # it does not mean rebuilding the graphs and geodesics: C,
+                    # the point-to-point map read out of it, the spectra, and
+                    # the settings that produced them. Phi in particular is
+                    # what the anchor hit-rate check needs. The eigenvectors
+                    # are the only bulky part -- (n x k) per side, tens of MB a
+                    # layer -- so they are opt-in; the rest is a few hundred KB.
+                    #
+                    # A k-sweep writes one directory per value, so each can be
+                    # loaded on its own by an eval job that skips computation.
+                    out_dir = save_dir if len(k_targets) == 1 else os.path.join(save_dir, f"k{k_target}")
+                    os.makedirs(out_dir, exist_ok=True)
+                    payload = {
+                        "T": T,
+                        "C": _to_cpu_tensor(fmap.C, torch.float32),
+                        "Phi_flat": _to_cpu_tensor(getattr(fmap, "Phi_flat", None), torch.int64),
+                        "eigvals_src": _to_cpu_tensor(graphs[0].eigvals, torch.float32),
+                        "eigvals_tgt": _to_cpu_tensor(graphs[1].eigvals, torch.float32),
+                        "anchors": anchor_idx.cpu().clone(),
+                        "similarity": float(sim),
+                        "settings": {
+                            "seed": int(seed),
+                            "n_anchors": None if n_anchors is None else int(n_anchors),
+                            "anchor_select": str(anchor_select),
+                            "k_graph": None if k_graph is None else int(k_graph),
+                            "center": bool(center),
+                            # A swept value was chosen explicitly, not selected,
+                            # so it records as fixed at that k -- which is what
+                            # an eval job pointed at this directory will ask for.
+                            "eig_select": "fixed" if len(k_targets) > 1 else str(eig_select),
+                            "num_eigs": int(k_target) if len(k_targets) > 1 else int(n_eig),
+                            "n_samples": int(n_samples),
+                            "descr_weight_ref": None if not descr_weight_ref else int(descr_weight_ref),
+                        },
+                        "n_eigs": int(k_target),
+                        "n_anchors": int(n_anch),
+                        "k_graph": int(k_eff),
+                        "n_real": int(n_real),
                         "n_samples": int(n_samples),
-                        "descr_weight_ref": None if not descr_weight_ref else int(descr_weight_ref),
-                    },
-                    "n_eigs": int(k_use),
-                    "n_anchors": int(n_anch),
-                    "k_graph": int(k_eff),
-                    "n_real": int(n_real),
-                    "n_samples": int(n_samples),
-                    "centered": bool(center),
-                    "src_shape": tuple(x_np.shape),
-                    "tgt_shape": tuple(y_np.shape),
-                }
-                if save_basis:
-                    payload["eigvecs_src"] = _to_cpu_tensor(graphs[0].eigvecs, torch.float32)
-                    payload["eigvecs_tgt"] = _to_cpu_tensor(graphs[1].eigvecs, torch.float32)
-                torch.save(payload, os.path.join(save_dir, f"{key}.pt"))
+                        "centered": bool(center),
+                        "src_shape": tuple(x_np.shape),
+                        "tgt_shape": tuple(y_np.shape),
+                    }
+                    if save_basis:
+                        payload["eigvecs_src"] = _to_cpu_tensor(graphs[0].eigvecs, torch.float32)
+                        payload["eigvecs_tgt"] = _to_cpu_tensor(graphs[1].eigvecs, torch.float32)
+                    torch.save(payload, os.path.join(out_dir, f"{key}.pt"))
 
-            print(
-                f"{log_prefix} {key}: fmap computed  "
-                f"C={c_shape}  T={tuple(fmap_transforms[key].shape)}  "
-                f"similarity={sim:.4f}"
-                + (f"  saved -> {key}.pt" if save_dir else "")
-            )
+                print(
+                    f"{log_prefix} {key}: fmap computed  k={k_target}  "
+                    f"C={c_shape}  T={tuple(T.shape)}  "
+                    f"similarity={sim:.4f}"
+                    + (f"  saved -> {key}.pt" if save_dir else "")
+                )
         except Exception as exc:
             print(f"{log_prefix} {key}: fmap computation failed — {exc}")
 
@@ -1772,7 +1833,7 @@ class TheseusRebase:
         n_interpolations: int = 0,
         interp_mode: str = "linear",
         use_fmap: bool = False,
-        fmap_num_eigs: int = 50,
+        fmap_num_eigs: int | list[int] = 50,
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
         fmap_anchor_select: str = "linspace",
@@ -1948,7 +2009,7 @@ class TheseusRebase:
                             anchor_select=str(fmap_anchor_select or "linspace"),
                             seed=int(seed),
                             center=bool(center_acts),
-                            num_eigs=int(fmap_num_eigs),
+                            num_eigs=fmap_num_eigs,
                             eig_select=str(fmap_eig_select),
                             descr_weight_ref=fmap_descr_weight_ref,
                             save_basis=bool(fmap_save_basis),
@@ -2148,7 +2209,7 @@ class TheseusRebase:
         n_interpolations: int = 0,
         interp_mode: str = "linear",
         use_fmap: bool = False,
-        fmap_num_eigs: int = 50,
+        fmap_num_eigs: int | list[int] = 50,
         fmap_k_graph: int | None = None,
         fmap_n_anchors: int | None = None,
         fmap_anchor_select: str = "linspace",
@@ -2199,7 +2260,7 @@ class TheseusRebase:
                 n_interpolations=int(n_interpolations),
                 interp_mode=str(interp_mode),
                 use_fmap=bool(use_fmap),
-                fmap_num_eigs=int(fmap_num_eigs),
+                fmap_num_eigs=fmap_num_eigs,
                 fmap_k_graph=fmap_k_graph,
                 fmap_n_anchors=fmap_n_anchors,
                 fmap_anchor_select=str(fmap_anchor_select or "linspace"),
