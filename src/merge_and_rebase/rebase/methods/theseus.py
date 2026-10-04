@@ -1307,6 +1307,93 @@ def _principal_basis(gram: torch.Tensor, rank: int | float) -> torch.Tensor | No
     return evecs[:, :r]
 
 
+def _needs_grams(whiten_power: float, activation_rank, activation_rank_select: str) -> bool:
+    """Whether the per-side Grams have to be accumulated.
+
+    Whitening needs them, a fixed rank needs them for the bases, and the
+    automatic selectors need them for the spectrum. Without them every one of
+    those paths silently degrades to full-rank Procrustes.
+    """
+    return (
+        float(whiten_power) > 0.0
+        or bool(activation_rank)
+        or str(activation_rank_select or "fixed").lower() in {"cca", "gap"}
+    )
+
+
+def _canonical_correlations(
+    cov: torch.Tensor,
+    a_gram: torch.Tensor,
+    b_gram: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Canonical correlations between the two activation sets, and their bases.
+
+    Whitening both sides turns the cross-covariance into the CCA matrix:
+
+        M = (A^T A)^-1/2 (A^T B) (B^T B)^-1/2 = U diag(rho) V^T
+
+    so the singular values are the canonical correlations -- how well direction i
+    on the source is predicted by the target at all -- and the columns of
+    (A^T A)^-1/2 U, (B^T B)^-1/2 V are the directions they belong to.
+
+    This is the quantity a rank selector should threshold. A per-side spectrum
+    cannot distinguish a direction that carries real energy in both models but
+    corresponds to nothing across them -- an architecture-specific direction --
+    from one that transports cleanly; rho can, because it is near zero for the
+    first and near one for the second.
+    """
+    inv_a = _matrix_power_psd(a_gram, power=-0.5, eps=eps)
+    inv_b = _matrix_power_psd(b_gram, power=-0.5, eps=eps)
+    m = inv_a @ cov.double() @ inv_b
+    u, rho, v_h = torch.linalg.svd(m, full_matrices=False)
+    return rho.clamp(0.0, 1.0), inv_a @ u, inv_b @ v_h.T
+
+
+def _rank_from_correlations(rho: torch.Tensor, *, n_samples: int, threshold: float) -> tuple[int, str]:
+    """How many canonical directions are above the noise floor.
+
+    With n rows and d columns of pure noise the canonical correlations do not sit
+    at zero -- they sit around sqrt(d / n), because a random d-dimensional
+    subspace of an n-dimensional space has that much overlap with another by
+    chance. The floor is therefore the larger of that finite-sample level and the
+    caller's threshold, so a layer measured from few rows is cut harder than a
+    layer measured from many.
+    """
+    d = int(rho.numel())
+    floor = max(float(threshold), (d / max(int(n_samples), 1)) ** 0.5)
+    keep = int((rho >= floor).sum())
+    keep = max(1, min(keep, d))
+    return keep, (
+        f"cca: {keep}/{d} directions with rho >= {floor:.3f} "
+        f"(threshold {threshold:.3f}, finite-sample {(d / max(int(n_samples), 1)) ** 0.5:.3f}), "
+        f"rho[0]={float(rho[0]):.3f} rho[{keep - 1}]={float(rho[keep - 1]):.3f}"
+    )
+
+
+def _rank_from_gap(evals: torch.Tensor, *, k_min: int = 1) -> tuple[int, str]:
+    """Cut at the largest relative drop in the spectrum.
+
+    No distributional assumption, unlike a noise-floor threshold: it looks for
+    the place where consecutive eigenvalues stop being comparable. Scored
+    relative to the local scale so the decision is not dominated by the leading
+    eigenvalue's absolute size. Mirrors how _choose_eig_cut picks the fmap basis.
+    """
+    lam = evals.flip(0).clamp_min(0.0)       # descending
+    d = int(lam.numel())
+    if d <= k_min + 1:
+        return max(1, d), f"gap: spectrum too short ({d}), keeping all"
+    ratios = lam[:-1] / lam[1:].clamp_min(torch.finfo(lam.dtype).tiny)
+    lo = max(k_min, 1)
+    idx = int(torch.argmax(ratios[lo:]).item()) + lo
+    keep = idx + 1
+    return keep, (
+        f"gap: {keep}/{d} directions, largest drop lam[{idx}]/lam[{idx + 1}]="
+        f"{float(ratios[idx]):.2f}"
+    )
+
+
 def _matrix_power_psd(matrix: torch.Tensor, *, power: float, eps: float) -> torch.Tensor:
     sym = 0.5 * (matrix + matrix.T)
     evals, evecs = torch.linalg.eigh(sym)
@@ -1336,10 +1423,65 @@ def _compute_alignment_map(
     whiten_power: float,
     whiten_eps: float,
     activation_rank: int | float | None = None,
+    activation_rank_select: str = "fixed",
+    activation_rank_threshold: float = 0.5,
+    key: str = "",
+    verbose: bool = False,
 ) -> torch.Tensor | None:
     cov = store.get_covariance(center=center)
     if cov is None:
         return None
+
+    select = str(activation_rank_select or "fixed").lower()
+    if select == "cca":
+        # The rank comes from the spectrum, so no activation_rank is needed: keep
+        # the directions whose canonical correlation clears the noise floor, and
+        # work directly in the CCA bases those directions live in.
+        a_gram = store.get_a_gram(center=center)
+        b_gram = store.get_b_gram(center=center)
+        if a_gram is None or b_gram is None:
+            logger.warning(
+                "Theseus activation_rank_select='cca' needs Gram statistics; "
+                "falling back to full-rank Procrustes."
+            )
+        else:
+            rho, basis_a, basis_b = _canonical_correlations(
+                cov, a_gram, b_gram, eps=whiten_eps
+            )
+            r, why = _rank_from_correlations(
+                rho, n_samples=int(store.n_samples), threshold=float(activation_rank_threshold)
+            )
+            if activation_rank:
+                r = min(r, int(activation_rank))   # a ceiling, if one was given
+            if verbose:
+                print(f"[theseus-rank] {key}: {why}")
+            p_a, p_b = basis_a[:, :r], basis_b[:, :r]
+            # Re-orthonormalise: the whitened bases are conjugate-orthogonal, not
+            # orthonormal, and T has to be a partial isometry to stay a rotation.
+            q_a, _ = torch.linalg.qr(p_a)
+            q_b, _ = torch.linalg.qr(p_b)
+            r_map = _compute_procrustes_map_from_cov(q_a.T @ cov.double() @ q_b)
+            return (q_a @ r_map.double() @ q_b.T).float()
+
+    if select == "gap":
+        a_gram = store.get_a_gram(center=center)
+        b_gram = store.get_b_gram(center=center)
+        if a_gram is None or b_gram is None:
+            logger.warning(
+                "Theseus activation_rank_select='gap' needs Gram statistics; "
+                "falling back to full-rank Procrustes."
+            )
+        else:
+            ev_a = torch.linalg.eigvalsh(0.5 * (a_gram + a_gram.T))
+            ev_b = torch.linalg.eigvalsh(0.5 * (b_gram + b_gram.T))
+            r_a, why_a = _rank_from_gap(ev_a)
+            r_b, why_b = _rank_from_gap(ev_b)
+            # The compressed Procrustes needs one shared r, and the smaller cut is
+            # the safe one: a direction the other side does not resolve cannot be
+            # matched anyway.
+            activation_rank = min(r_a, r_b)
+            if verbose:
+                print(f"[theseus-rank] {key}: src {why_a} | tgt {why_b} -> r={activation_rank}")
 
     if activation_rank:
         # Compress both activation sets to their leading directions, fit the
@@ -1615,6 +1757,9 @@ def _precompute_transforms(
     method_name: str,
     fmap_transforms: Mapping[str, torch.Tensor] | None = None,
     activation_rank: int | float | None = None,
+    activation_rank_select: str = "fixed",
+    activation_rank_threshold: float = 0.5,
+    verbose: bool = False,
 ) -> dict[str, _LayerTransform]:
     transforms_by_key: dict[str, _LayerTransform] = {}
     t_out_cache: dict[str, torch.Tensor] = {}
@@ -1667,6 +1812,10 @@ def _precompute_transforms(
                             whiten_power=whiten_power,
                             whiten_eps=whiten_eps,
                             activation_rank=activation_rank,
+                            activation_rank_select=activation_rank_select,
+                            activation_rank_threshold=activation_rank_threshold,
+                            key=in_key,
+                            verbose=verbose,
                         )
                     if t_out is None:
                         t_out = _compute_alignment_map(
@@ -1675,6 +1824,10 @@ def _precompute_transforms(
                             whiten_power=whiten_power,
                             whiten_eps=whiten_eps,
                             activation_rank=activation_rank,
+                            activation_rank_select=activation_rank_select,
+                            activation_rank_threshold=activation_rank_threshold,
+                            key=out_key,
+                            verbose=verbose,
                         )
 
             if t_in is not None and t_out is not None:
@@ -1712,6 +1865,10 @@ def _precompute_transforms(
                     whiten_power=whiten_power,
                     whiten_eps=whiten_eps,
                     activation_rank=activation_rank,
+                    activation_rank_select=activation_rank_select,
+                    activation_rank_threshold=activation_rank_threshold,
+                    key=out_key,
+                    verbose=verbose,
                 )
                 if t_out is not None:
                     t_out_cache[out_key] = t_out
@@ -1904,6 +2061,8 @@ class TheseusRebase:
         fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
         activation_rank: int | float | None = None,
+        activation_rank_select: str = "fixed",
+        activation_rank_threshold: float = 0.5,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -1933,7 +2092,8 @@ class TheseusRebase:
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
                 f"whiten_power={whiten_power}, covariance_mode={covariance_mode}, "
-                f"activation_rank={activation_rank}, "
+                f"activation_rank={activation_rank}"
+                f"{'' if str(activation_rank_select).lower() == 'fixed' else f'/{activation_rank_select}@{activation_rank_threshold}'}, "
                 f"n_batches={n_batches}, seed={int(seed)})"
             )
 
@@ -2010,8 +2170,8 @@ class TheseusRebase:
                         store_raw=n_interpolations > 0 or use_fmap,
                         # activation_rank reads the per-side principal directions
                         # off these, so they are needed even without whitening.
-                        store_a_gram=whiten_power > 0.0 or bool(activation_rank),
-                        store_b_gram=whiten_power > 0.0 or bool(activation_rank),
+                        store_a_gram=_needs_grams(whiten_power, activation_rank, activation_rank_select),
+                        store_b_gram=_needs_grams(whiten_power, activation_rank, activation_rank_select),
                     )
                     if verbose:
                         print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
@@ -2123,6 +2283,9 @@ class TheseusRebase:
                         method_name=self.name,
                         fmap_transforms=fmap_transforms if fmap_transforms else None,
                         activation_rank=activation_rank,
+                        activation_rank_select=activation_rank_select,
+                        activation_rank_threshold=activation_rank_threshold,
+                        verbose=bool(verbose),
                     )
                 else:
                     transforms_by_key = _precompute_transforms_data_free(
@@ -2285,6 +2448,8 @@ class TheseusRebase:
         fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
         activation_rank: int | float | None = None,
+        activation_rank_select: str = "fixed",
+        activation_rank_threshold: float = 0.5,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -2335,6 +2500,8 @@ class TheseusRebase:
                 balanced_batches=bool(balanced_batches),
                 fmap_eig_select=str(fmap_eig_select),
                 activation_rank=activation_rank,
+                activation_rank_select=activation_rank_select,
+                activation_rank_threshold=activation_rank_threshold,
                 fmap_descr_weight_ref=fmap_descr_weight_ref,
                 fmap_save_basis=bool(fmap_save_basis),
                 activations_path=activations_path,
