@@ -1277,6 +1277,36 @@ def _compute_procrustes_map_from_cov(cov: torch.Tensor) -> torch.Tensor:
     return (u @ v_h).float()
 
 
+def _principal_basis(gram: torch.Tensor, rank: int | float) -> torch.Tensor | None:
+    """Top directions of one side's activation set, taken from its Gram matrix.
+
+    A^T A has the same eigenvectors as the PCA of A, so the basis is available
+    from the running Gram without keeping a single activation row -- which is why
+    this costs nothing beyond the d x d accumulation already done for whitening.
+
+    ``rank`` as an int is a fixed number of directions. As a float in (0, 1) it is
+    the share of the spectrum to keep, resolved per layer, so narrow layers are
+    not forced to carry as many directions as wide ones.
+    """
+    sym = 0.5 * (gram + gram.T)
+    evals, evecs = torch.linalg.eigh(sym)
+    # eigh returns ascending; the leading directions are wanted first.
+    evals = evals.flip(0).clamp_min(0.0)
+    evecs = evecs.flip(1)
+    d = int(evecs.shape[1])
+
+    if isinstance(rank, float) and 0.0 < rank < 1.0:
+        total = float(evals.sum())
+        if total <= 0.0:
+            return None
+        csum = torch.cumsum(evals, dim=0) / total
+        r = int(torch.searchsorted(csum, torch.tensor(rank, dtype=csum.dtype)).item()) + 1
+    else:
+        r = int(rank)
+    r = max(1, min(r, d))
+    return evecs[:, :r]
+
+
 def _matrix_power_psd(matrix: torch.Tensor, *, power: float, eps: float) -> torch.Tensor:
     sym = 0.5 * (matrix + matrix.T)
     evals, evecs = torch.linalg.eigh(sym)
@@ -1305,10 +1335,38 @@ def _compute_alignment_map(
     center: bool,
     whiten_power: float,
     whiten_eps: float,
+    activation_rank: int | float | None = None,
 ) -> torch.Tensor | None:
     cov = store.get_covariance(center=center)
     if cov is None:
         return None
+
+    if activation_rank:
+        # Compress both activation sets to their leading directions, fit the
+        # Procrustes in those coordinates, then lift the map back:
+        #     R = argmin ||(A P_a) R - (B P_b)||,  T = P_a R P_b^T
+        # P_a^T (A^T B) P_b is the cross-covariance of the compressed sets, so
+        # no rows are needed -- only the Grams and the cross-covariance already
+        # accumulated. T comes out with rank r: orthogonal between the two
+        # retained subspaces, zero outside them, which is the point -- the tail
+        # directions are estimated from almost no signal yet a full Procrustes
+        # weights them the same as the leading ones.
+        a_gram = store.get_a_gram(center=center)
+        b_gram = store.get_b_gram(center=center)
+        if a_gram is None or b_gram is None:
+            logger.warning(
+                "Theseus activation_rank requested but Gram statistics were unavailable; "
+                "falling back to full-rank Procrustes."
+            )
+        else:
+            p_a = _principal_basis(a_gram, activation_rank)
+            p_b = _principal_basis(b_gram, activation_rank)
+            if p_a is not None and p_b is not None:
+                # One shared r: the compressed Procrustes needs a square problem.
+                r = min(int(p_a.shape[1]), int(p_b.shape[1]))
+                p_a, p_b = p_a[:, :r].double(), p_b[:, :r].double()
+                r_map = _compute_procrustes_map_from_cov(p_a.T @ cov.double() @ p_b)
+                return (p_a @ r_map.double() @ p_b.T).float()
     if whiten_power > 0.0:
         a_gram = store.get_a_gram(center=center, epsilon=whiten_eps)
         b_gram = store.get_b_gram(center=center, epsilon=whiten_eps)
@@ -1556,6 +1614,7 @@ def _precompute_transforms(
     show_progress: bool,
     method_name: str,
     fmap_transforms: Mapping[str, torch.Tensor] | None = None,
+    activation_rank: int | float | None = None,
 ) -> dict[str, _LayerTransform]:
     transforms_by_key: dict[str, _LayerTransform] = {}
     t_out_cache: dict[str, torch.Tensor] = {}
@@ -1607,6 +1666,7 @@ def _precompute_transforms(
                             center=center_acts,
                             whiten_power=whiten_power,
                             whiten_eps=whiten_eps,
+                            activation_rank=activation_rank,
                         )
                     if t_out is None:
                         t_out = _compute_alignment_map(
@@ -1614,6 +1674,7 @@ def _precompute_transforms(
                             center=center_acts,
                             whiten_power=whiten_power,
                             whiten_eps=whiten_eps,
+                            activation_rank=activation_rank,
                         )
 
             if t_in is not None and t_out is not None:
@@ -1650,6 +1711,7 @@ def _precompute_transforms(
                     center=center_acts,
                     whiten_power=whiten_power,
                     whiten_eps=whiten_eps,
+                    activation_rank=activation_rank,
                 )
                 if t_out is not None:
                     t_out_cache[out_key] = t_out
@@ -1841,6 +1903,7 @@ class TheseusRebase:
         fmap_eig_select: str = "fixed",
         fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
+        activation_rank: int | float | None = None,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -1870,6 +1933,7 @@ class TheseusRebase:
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
                 f"whiten_power={whiten_power}, covariance_mode={covariance_mode}, "
+                f"activation_rank={activation_rank}, "
                 f"n_batches={n_batches}, seed={int(seed)})"
             )
 
@@ -1944,8 +2008,10 @@ class TheseusRebase:
                         batch_size=batch_size,
                         balanced_batches=bool(balanced_batches),
                         store_raw=n_interpolations > 0 or use_fmap,
-                        store_a_gram=whiten_power > 0.0,
-                        store_b_gram=whiten_power > 0.0,
+                        # activation_rank reads the per-side principal directions
+                        # off these, so they are needed even without whitening.
+                        store_a_gram=whiten_power > 0.0 or bool(activation_rank),
+                        store_b_gram=whiten_power > 0.0 or bool(activation_rank),
                     )
                     if verbose:
                         print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
@@ -2056,6 +2122,7 @@ class TheseusRebase:
                         show_progress=bool(show_progress),
                         method_name=self.name,
                         fmap_transforms=fmap_transforms if fmap_transforms else None,
+                        activation_rank=activation_rank,
                     )
                 else:
                     transforms_by_key = _precompute_transforms_data_free(
@@ -2217,6 +2284,7 @@ class TheseusRebase:
         fmap_eig_select: str = "fixed",
         fmap_descr_weight_ref: int | None = 200,
         fmap_save_basis: bool = False,
+        activation_rank: int | float | None = None,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -2266,6 +2334,7 @@ class TheseusRebase:
                 fmap_anchor_select=str(fmap_anchor_select or "linspace"),
                 balanced_batches=bool(balanced_batches),
                 fmap_eig_select=str(fmap_eig_select),
+                activation_rank=activation_rank,
                 fmap_descr_weight_ref=fmap_descr_weight_ref,
                 fmap_save_basis=bool(fmap_save_basis),
                 activations_path=activations_path,
