@@ -413,6 +413,58 @@ class _ActivationHook:
             handle.remove()
 
 
+def _orthonormal_patch_batch(
+    shape: tuple[int, ...], patch: int, generator: torch.Generator
+) -> torch.Tensor:
+    """A batch whose flattened patches are orthonormal, so P^T P is isotropic.
+
+    Gaussian inputs give P^T P = I only in expectation, with error ~sqrt(d/n);
+    that is the whole reason more noise kept helping. Filling the patch grid from
+    orthonormal bases instead makes the identity hold by construction, so the
+    cross-covariance lands on the weight-space quantity without having to average
+    the error away.
+
+    Patch slots are filled from a stream of fresh orthonormal bases of the patch
+    space. Whole bases contribute exactly I each; only the final partial basis is
+    anisotropic, by one unit out of however many complete ones came before -- at
+    225 patches per image that is sub-percent after a single batch, against ~8%
+    for Gaussian noise at B=20.
+
+    No zero padding: a blank patch would send every layer downstream a repeated
+    constant row, which is a far worse anisotropy than the one being fixed.
+    """
+    n, c, h, w = shape
+    gh, gw = h // patch, w // patch
+    needed = n * gh * gw
+    d = c * patch * patch
+
+    cols = []
+    while sum(q.shape[1] for q in cols) < needed:
+        q, _ = torch.linalg.qr(torch.randn(d, d, generator=generator, dtype=torch.float32))
+        cols.append(q)
+    basis = torch.cat(cols, dim=1)[:, :needed]              # (d, needed)
+
+    # (needed, c, patch, patch) -> grid -> (n, c, h, w)
+    patches = basis.T.reshape(needed, c, patch, patch)
+    out = patches.reshape(n, gh, gw, c, patch, patch)
+    out = out.permute(0, 3, 1, 4, 2, 5).reshape(n, c, gh * patch, gw * patch)
+    if (gh * patch, gw * patch) != (h, w):
+        # Non-divisible resolutions keep the remainder at zero; it is outside
+        # every patch the model reads, so it contributes nothing either way.
+        padded = torch.zeros(n, c, h, w)
+        padded[:, :, : gh * patch, : gw * patch] = out
+        out = padded
+    return out
+
+
+def _patch_size(model: torch.nn.Module) -> int | None:
+    conv1 = getattr(_visual_module(model), "conv1", None)
+    k = getattr(conv1, "kernel_size", None)
+    if k is None:
+        return None
+    return int(k[0]) if isinstance(k, (tuple, list)) else int(k)
+
+
 @torch.no_grad()
 def collect_activations(
     source_model: torch.nn.Module,
@@ -430,6 +482,7 @@ def collect_activations(
     store_b_gram: bool = False,
     balanced_batches: bool = False,
     gaussian_inputs: bool = False,
+    synthetic_inputs: str | None = None,
 ) -> dict[str, ActivationStore]:
     registry: dict[str, ActivationStore] = {}
     source_hook = _ActivationHook(source_model)
@@ -460,7 +513,8 @@ def collect_activations(
                     f"Got {source_imgs.shape[0]} and {target_imgs.shape[0]}."
                 )
 
-            if gaussian_inputs:
+            mode = str(synthetic_inputs or ("gaussian" if gaussian_inputs else "")).lower()
+            if mode in {"gaussian", "orthogonal"}:
                 # Replace the images with noise, keeping the correspondence the
                 # covariance depends on: ONE sample per batch element, resized to
                 # each model's own input resolution -- exactly what the real
@@ -468,9 +522,21 @@ def collect_activations(
                 # independent draws would pair activations of unrelated inputs
                 # and the cross-covariance would be estimating nothing.
                 gen = torch.Generator().manual_seed(int(seed) * 100003 + idx)
-                noise = torch.randn(
-                    source_imgs.shape, generator=gen, dtype=torch.float32
-                ).to(dev, source_imgs.dtype)
+                patch = _patch_size(source_model) if mode == "orthogonal" else None
+                if mode == "orthogonal" and patch:
+                    synth = _orthonormal_patch_batch(
+                        tuple(source_imgs.shape), patch, gen
+                    ).to(dev, source_imgs.dtype)
+                else:
+                    if mode == "orthogonal":
+                        logger.warning(
+                            "Theseus synthetic_inputs='orthogonal' could not read the patch "
+                            "size; falling back to gaussian."
+                        )
+                    synth = torch.randn(
+                        source_imgs.shape, generator=gen, dtype=torch.float32
+                    ).to(dev, source_imgs.dtype)
+                noise = synth
                 source_imgs = noise
                 if tuple(target_imgs.shape[-2:]) != tuple(noise.shape[-2:]):
                     target_imgs = torch.nn.functional.interpolate(
@@ -2088,6 +2154,7 @@ class TheseusRebase:
         activation_rank_select: str = "fixed",
         activation_rank_threshold: float = 0.5,
         gaussian_inputs: bool = False,
+        synthetic_inputs: str | None = None,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -2117,7 +2184,7 @@ class TheseusRebase:
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
                 f"whiten_power={whiten_power}, covariance_mode={covariance_mode}, "
-                f"gaussian_inputs={bool(gaussian_inputs)}, "
+                f"inputs={str(synthetic_inputs or ('gaussian' if gaussian_inputs else 'data'))}, "
                 f"activation_rank={activation_rank}"
                 f"{'' if str(activation_rank_select).lower() == 'fixed' else f'/{activation_rank_select}@{activation_rank_threshold}'}, "
                 f"n_batches={n_batches}, seed={int(seed)})"
@@ -2194,6 +2261,7 @@ class TheseusRebase:
                         batch_size=batch_size,
                         balanced_batches=bool(balanced_batches),
                         gaussian_inputs=bool(gaussian_inputs),
+                        synthetic_inputs=synthetic_inputs,
                         store_raw=n_interpolations > 0 or use_fmap,
                         # activation_rank reads the per-side principal directions
                         # off these, so they are needed even without whitening.
@@ -2478,6 +2546,7 @@ class TheseusRebase:
         activation_rank_select: str = "fixed",
         activation_rank_threshold: float = 0.5,
         gaussian_inputs: bool = False,
+        synthetic_inputs: str | None = None,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -2531,6 +2600,7 @@ class TheseusRebase:
                 activation_rank_select=activation_rank_select,
                 activation_rank_threshold=activation_rank_threshold,
                 gaussian_inputs=gaussian_inputs,
+                synthetic_inputs=synthetic_inputs,
                 fmap_descr_weight_ref=fmap_descr_weight_ref,
                 fmap_save_basis=bool(fmap_save_basis),
                 activations_path=activations_path,
