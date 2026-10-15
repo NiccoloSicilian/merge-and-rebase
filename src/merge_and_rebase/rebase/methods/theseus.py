@@ -429,6 +429,7 @@ def collect_activations(
     store_a_gram: bool = False,
     store_b_gram: bool = False,
     balanced_batches: bool = False,
+    gaussian_inputs: bool = False,
 ) -> dict[str, ActivationStore]:
     registry: dict[str, ActivationStore] = {}
     source_hook = _ActivationHook(source_model)
@@ -458,6 +459,29 @@ def collect_activations(
                     "Theseus calibration expects aligned batch sizes. "
                     f"Got {source_imgs.shape[0]} and {target_imgs.shape[0]}."
                 )
+
+            if gaussian_inputs:
+                # Replace the images with noise, keeping the correspondence the
+                # covariance depends on: ONE sample per batch element, resized to
+                # each model's own input resolution -- exactly what the real
+                # pipeline does when it preprocesses the same image twice. Two
+                # independent draws would pair activations of unrelated inputs
+                # and the cross-covariance would be estimating nothing.
+                gen = torch.Generator().manual_seed(int(seed) * 100003 + idx)
+                noise = torch.randn(
+                    source_imgs.shape, generator=gen, dtype=torch.float32
+                ).to(dev, source_imgs.dtype)
+                source_imgs = noise
+                if tuple(target_imgs.shape[-2:]) != tuple(noise.shape[-2:]):
+                    target_imgs = torch.nn.functional.interpolate(
+                        noise.float(),
+                        size=tuple(target_imgs.shape[-2:]),
+                        mode="bilinear",
+                        align_corners=False,
+                        antialias=True,
+                    ).to(target_imgs.dtype)
+                else:
+                    target_imgs = noise.clone()
 
             _encode_image(source_model, source_imgs)
             _encode_image(target_model, target_imgs)
@@ -2063,6 +2087,7 @@ class TheseusRebase:
         activation_rank: int | float | None = None,
         activation_rank_select: str = "fixed",
         activation_rank_threshold: float = 0.5,
+        gaussian_inputs: bool = False,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -2092,6 +2117,7 @@ class TheseusRebase:
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
                 f"whiten_power={whiten_power}, covariance_mode={covariance_mode}, "
+                f"gaussian_inputs={bool(gaussian_inputs)}, "
                 f"activation_rank={activation_rank}"
                 f"{'' if str(activation_rank_select).lower() == 'fixed' else f'/{activation_rank_select}@{activation_rank_threshold}'}, "
                 f"n_batches={n_batches}, seed={int(seed)})"
@@ -2167,6 +2193,7 @@ class TheseusRebase:
                         seed=int(seed),
                         batch_size=batch_size,
                         balanced_batches=bool(balanced_batches),
+                        gaussian_inputs=bool(gaussian_inputs),
                         store_raw=n_interpolations > 0 or use_fmap,
                         # activation_rank reads the per-side principal directions
                         # off these, so they are needed even without whitening.
@@ -2450,6 +2477,7 @@ class TheseusRebase:
         activation_rank: int | float | None = None,
         activation_rank_select: str = "fixed",
         activation_rank_threshold: float = 0.5,
+        gaussian_inputs: bool = False,
         activations_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
@@ -2502,6 +2530,7 @@ class TheseusRebase:
                 activation_rank=activation_rank,
                 activation_rank_select=activation_rank_select,
                 activation_rank_threshold=activation_rank_threshold,
+                gaussian_inputs=gaussian_inputs,
                 fmap_descr_weight_ref=fmap_descr_weight_ref,
                 fmap_save_basis=bool(fmap_save_basis),
                 activations_path=activations_path,
