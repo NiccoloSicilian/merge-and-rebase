@@ -414,7 +414,10 @@ class _ActivationHook:
 
 
 def _orthonormal_patch_batch(
-    shape: tuple[int, ...], patch: int, generator: torch.Generator
+    shape: tuple[int, ...],
+    patch: int,
+    generator: torch.Generator,
+    carry: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """A batch whose flattened patches are orthonormal, so P^T P is isotropic.
 
@@ -432,17 +435,33 @@ def _orthonormal_patch_batch(
 
     No zero padding: a blank patch would send every layer downstream a repeated
     constant row, which is a far worse anisotropy than the one being fixed.
+
+    The columns are scaled to norm sqrt(d), matching a standard-normal patch.
+    Scaling a basis by c leaves the sum at c^2 I, so isotropy is untouched, but it
+    matters anyway: a unit-norm patch is 27x smaller than a Gaussian one at
+    d=768, and GELU and LayerNorm are not scale invariant, so an unscaled basis
+    would probe the network in a regime it never operates in.
+
+    ``carry`` holds leftover columns between calls. Without it each batch
+    truncates its own final basis, leaving a few percent of anisotropy that
+    repeats every batch and only averages down as 1/sqrt(B) -- which would show
+    up as a B-dependence that has nothing to do with the network.
     """
     n, c, h, w = shape
     gh, gw = h // patch, w // patch
     needed = n * gh * gw
     d = c * patch * patch
 
-    cols = []
+    cols = list(carry) if carry else []
     while sum(q.shape[1] for q in cols) < needed:
         q, _ = torch.linalg.qr(torch.randn(d, d, generator=generator, dtype=torch.float32))
-        cols.append(q)
-    basis = torch.cat(cols, dim=1)[:, :needed]              # (d, needed)
+        cols.append(q * (d ** 0.5))
+    pool = torch.cat(cols, dim=1)
+    basis, leftover = pool[:, :needed], pool[:, needed:]
+    if carry is not None:
+        carry.clear()
+        if leftover.shape[1]:
+            carry.append(leftover)
 
     # (needed, c, patch, patch) -> grid -> (n, c, h, w)
     patches = basis.T.reshape(needed, c, patch, patch)
@@ -489,6 +508,11 @@ def collect_activations(
     target_hook = _ActivationHook(target_model)
     dev = _resolve_device(device)
 
+    # One generator and one basis pool for the whole collection: the orthonormal
+    # stream has to continue across batches rather than restart in each.
+    synth_gen = torch.Generator().manual_seed(int(seed) * 100003 + 1)
+    basis_carry: list[torch.Tensor] = []
+
     try:
         iterator = _iter_random_dataset_batches(
             source_dataloader,
@@ -525,7 +549,7 @@ def collect_activations(
                 patch = _patch_size(source_model) if mode == "orthogonal" else None
                 if mode == "orthogonal" and patch:
                     synth = _orthonormal_patch_batch(
-                        tuple(source_imgs.shape), patch, gen
+                        tuple(source_imgs.shape), patch, synth_gen, basis_carry
                     ).to(dev, source_imgs.dtype)
                 else:
                     if mode == "orthogonal":
