@@ -484,6 +484,60 @@ def _patch_size(model: torch.nn.Module) -> int | None:
     return int(k[0]) if isinstance(k, (tuple, list)) else int(k)
 
 
+def _transform_settings(**kw) -> dict:
+    """Everything the per-layer maps depend on -- and nothing that identifies the task.
+
+    The point of caching these is that T is a property of the two models and the
+    calibration procedure, not of the task vector being transported. The task is
+    therefore deliberately absent from the key, while anything that changes the
+    maps themselves is in it, so a cache built under other settings is rejected
+    rather than silently reused.
+    """
+    return {k: (None if v is None else (float(v) if isinstance(v, float) else
+                (bool(v) if isinstance(v, bool) else (int(v) if isinstance(v, int) else str(v)))))
+            for k, v in sorted(kw.items())}
+
+
+def _save_layer_transforms(
+    transforms: Mapping[str, "_LayerTransform"], path: str, settings: dict
+) -> None:
+    payload = {
+        "settings": settings,
+        "transforms": {
+            key: {"kind": t.kind,
+                  "t_in": None if t.t_in is None else t.t_in.detach().cpu(),
+                  "t_out": None if t.t_out is None else t.t_out.detach().cpu()}
+            for key, t in transforms.items()
+        },
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    torch.save(payload, path)
+
+
+def _load_layer_transforms(path: str, settings: dict) -> dict[str, "_LayerTransform"] | None:
+    """Reload saved maps, or None with the reason logged if they do not apply."""
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(obj, dict) or "transforms" not in obj:
+        logger.warning("Theseus transforms_path %s is not a transform cache; recomputing.", path)
+        return None
+    saved = obj.get("settings") or {}
+    for field, want in settings.items():
+        if saved.get(field) != want:
+            logger.warning(
+                "Theseus transforms_path %s was built with %s=%r, this run wants %r; recomputing.",
+                path, field, saved.get(field), want,
+            )
+            return None
+    return {
+        key: _LayerTransform(
+            kind=v["kind"],
+            t_in=None if v.get("t_in") is None else v["t_in"],
+            t_out=None if v.get("t_out") is None else v["t_out"],
+        )
+        for key, v in obj["transforms"].items()
+    }
+
+
 @torch.no_grad()
 def collect_activations(
     source_model: torch.nn.Module,
@@ -2180,6 +2234,7 @@ class TheseusRebase:
         gaussian_inputs: bool = False,
         synthetic_inputs: str | None = None,
         activations_path: str | None = None,
+        transforms_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
         show_progress: bool = True,
@@ -2256,8 +2311,45 @@ class TheseusRebase:
         )
         unpatched_source = 0
         unpatched_target = 0
+
+        # T depends on the two models and on the calibration procedure, not on the
+        # task vector being transported -- so a cache hit skips the activation
+        # collection entirely and a new task costs only the alpha search and eval.
+        # The task is deliberately absent from the key; anything that changes the
+        # maps is in it, so a cache from other settings is rejected, not reused.
+        _tf_settings = _transform_settings(
+            covariance_mode=covariance_mode,
+            seq_align=seq_align,
+            center_acts=bool(center_acts),
+            whiten_power=whiten_power,
+            whiten_eps=whiten_eps,
+            split_qkv=bool(patch_qkv),
+            n_batches=n_batches,
+            batch_size=batch_size,
+            seed=int(seed),
+            n_interpolations=n_interpolations,
+            interp_mode=str(interp_mode),
+            inputs=str(synthetic_inputs or ("gaussian" if gaussian_inputs else "data")),
+            use_fmap=bool(use_fmap),
+            fmap_num_eigs=str(fmap_num_eigs),
+            fmap_n_anchors=fmap_n_anchors,
+            fmap_anchor_select=str(fmap_anchor_select),
+            fmap_k_graph=fmap_k_graph,
+            activation_rank=activation_rank,
+            activation_rank_select=str(activation_rank_select),
+            activation_rank_threshold=activation_rank_threshold,
+        )
+        _loaded_transforms: dict[str, _LayerTransform] | None = None
+        if transforms_path and os.path.isfile(transforms_path):
+            _loaded_transforms = _load_layer_transforms(transforms_path, _tf_settings)
+            if _loaded_transforms is not None and verbose:
+                print(
+                    f"{log_prefix} prepare: loaded {len(_loaded_transforms)} per-layer "
+                    f"transforms from {transforms_path} (activation collection skipped)"
+                )
+
         try:
-            if covariance_mode == "activations":
+            if covariance_mode == "activations" and _loaded_transforms is None:
                 _act_path = activations_path if activations_path else None
 
                 if _act_path and os.path.isfile(_act_path):
@@ -2389,7 +2481,15 @@ class TheseusRebase:
                     target_visual_base = _split_fused_qkv_state(target_visual_base)
                     visual_delta = _split_fused_qkv_state(visual_delta)
 
-                if covariance_mode == "activations":
+                if _loaded_transforms is not None:
+                    missing = [k for k in visual_delta if k not in _loaded_transforms]
+                    if missing and verbose:
+                        print(
+                            f"{log_prefix} prepare: {len(missing)} delta keys absent from the "
+                            f"cache (e.g. {missing[:3]}) -- those layers stay untransformed"
+                        )
+                    transforms_by_key = dict(_loaded_transforms)
+                elif covariance_mode == "activations":
                     transforms_by_key = _precompute_transforms(
                         target_model=target_model,
                         target_visual_base=target_visual_base,
@@ -2432,6 +2532,14 @@ class TheseusRebase:
                         )
                 except Exception as exc:
                     logger.warning("%s prepare: failed to recompose patched attention blocks: %s", self.name, exc)
+
+        if transforms_path and _loaded_transforms is None and transforms_by_key:
+            _save_layer_transforms(transforms_by_key, transforms_path, _tf_settings)
+            if verbose:
+                print(
+                    f"{log_prefix} prepare: saved {len(transforms_by_key)} per-layer "
+                    f"transforms -> {transforms_path}"
+                )
 
         if verbose:
             print(f"{log_prefix} prepare: done")
@@ -2572,6 +2680,7 @@ class TheseusRebase:
         gaussian_inputs: bool = False,
         synthetic_inputs: str | None = None,
         activations_path: str | None = None,
+        transforms_path: str | None = None,
         fmap_transforms_path: str | None = None,
         verbose: bool = True,
         show_progress: bool = True,
@@ -2625,6 +2734,7 @@ class TheseusRebase:
                 activation_rank_threshold=activation_rank_threshold,
                 gaussian_inputs=gaussian_inputs,
                 synthetic_inputs=synthetic_inputs,
+                transforms_path=transforms_path,
                 fmap_descr_weight_ref=fmap_descr_weight_ref,
                 fmap_save_basis=bool(fmap_save_basis),
                 activations_path=activations_path,
